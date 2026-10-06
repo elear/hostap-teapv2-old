@@ -1741,6 +1741,8 @@ int tls_connection_get_failed(void *ssl_ctx, struct tls_connection *conn)
 	return conn->failed;
 }
 
+
+#ifdef CONFIG_EAP_TEAPV2
 int tls_connection_peer_cert_validity(void *ssl_ctx,
 				      struct tls_connection *conn,
 				      struct os_time *not_before,
@@ -1770,6 +1772,7 @@ struct wpabuf * tls_connection_sign_pkcs7(void *tls_ctx, const u8 *pkcs10,
 	(void) key_file;
 	return NULL;
 }
+#endif /* CONFIG_EAP_TEAPV2 */
 
 
 int tls_connection_get_read_alerts(void *ssl_ctx, struct tls_connection *conn)

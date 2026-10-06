@@ -32,7 +32,9 @@
 #include <openssl/err.h>
 #include <openssl/opensslv.h>
 #include <openssl/pkcs12.h>
+#ifdef CONFIG_EAP_TEAPV2
 #include <openssl/pkcs7.h>
+#endif /* CONFIG_EAP_TEAPV2 */
 #include <openssl/x509v3.h>
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 #include <openssl/core_names.h>
@@ -66,8 +68,7 @@
 #if defined(EAP_FAST) || defined(EAP_FAST_DYNAMIC) || \
 	defined(EAP_SERVER_FAST) || defined(EAP_TEAP) || \
 	defined(EAP_TEAP_DYNAMIC) || defined(EAP_SERVER_TEAP) || \
-	defined(EAP_TEAPV2) || defined(EAP_TEAPV2_DYNAMIC) || \
-	defined(EAP_SERVER_TEAPV2)
+	defined(CONFIG_EAP_TEAPV2)
 #define EAP_FAST_OR_TEAP
 #endif
 
@@ -3494,6 +3495,7 @@ static int suiteb_cert_cb(SSL *ssl, void *arg)
 #endif /* CONFIG_SUITEB */
 
 
+#ifdef CONFIG_EAP_TEAPV2
 static int tls_set_cipher_string(SSL_CTX *ctx, SSL *ssl,
 				 const char *ciphers)
 {
@@ -3521,6 +3523,7 @@ static int tls_set_cipher_string(SSL_CTX *ctx, SSL *ssl,
 
 	return 0;
 }
+#endif /* CONFIG_EAP_TEAPV2 */
 
 
 static int tls_set_conn_flags(struct tls_connection *conn, unsigned int flags,
@@ -3739,13 +3742,27 @@ static int tls_set_conn_flags(struct tls_connection *conn, unsigned int flags,
 #else /* OPENSSL_IS_BORINGSSL */
 	if (!(flags & (TLS_CONN_SUITEB | TLS_CONN_SUITEB_NO_ECDH)) &&
 	    openssl_ciphers &&
+#ifdef CONFIG_EAP_TEAPV2
 	    tls_set_cipher_string(NULL, ssl, openssl_ciphers) < 0) {
+#else /* CONFIG_EAP_TEAPV2 */
+	    SSL_set_cipher_list(ssl, openssl_ciphers) != 1) {
+		wpa_printf(MSG_INFO,
+			   "OpenSSL: Failed to set openssl_ciphers '%s'",
+			   openssl_ciphers);
+#endif /* CONFIG_EAP_TEAPV2 */
 		return -1;
 	}
 #endif /* OPENSSL_IS_BORINGSSL */
 #else /* CONFIG_SUITEB */
 	if (openssl_ciphers &&
+#ifdef CONFIG_EAP_TEAPV2
 	    tls_set_cipher_string(NULL, ssl, openssl_ciphers) < 0) {
+#else /* CONFIG_EAP_TEAPV2 */
+	    SSL_set_cipher_list(ssl, openssl_ciphers) != 1) {
+		wpa_printf(MSG_INFO,
+			   "OpenSSL: Failed to set openssl_ciphers '%s'",
+			   openssl_ciphers);
+#endif /* CONFIG_EAP_TEAPV2 */
 		return -1;
 	}
 #endif /* CONFIG_SUITEB */
@@ -5406,6 +5423,8 @@ int tls_connection_get_failed(void *ssl_ctx, struct tls_connection *conn)
 	return conn->failed;
 }
 
+
+#ifdef CONFIG_EAP_TEAPV2
 static int openssl_asn1_time_to_os_time(const ASN1_TIME *asn1,
 					struct os_time *t)
 {
@@ -5764,6 +5783,7 @@ fail:
 	BIO_free(kbio);
 	return out;
 }
+#endif /* CONFIG_EAP_TEAPV2 */
 
 
 int tls_connection_get_read_alerts(void *ssl_ctx, struct tls_connection *conn)
@@ -6270,7 +6290,14 @@ int tls_connection_set_params(void *tls_ctx, struct tls_connection *conn,
 	}
 #endif /* OPENSSL_IS_BORINGSSL */
 #endif /* CONFIG_SUITEB */
-	if (ciphers && tls_set_cipher_string(NULL, conn->ssl, ciphers) < 0) {
+	if (ciphers &&
+#ifdef CONFIG_EAP_TEAPV2
+	    tls_set_cipher_string(NULL, conn->ssl, ciphers) < 0) {
+#else /* CONFIG_EAP_TEAPV2 */
+	    SSL_set_cipher_list(conn->ssl, ciphers) != 1) {
+		wpa_printf(MSG_INFO,
+			   "OpenSSL: Failed to set cipher string '%s'", ciphers);
+#endif /* CONFIG_EAP_TEAPV2 */
 		return -1;
 	}
 
@@ -6507,8 +6534,15 @@ int tls_global_set_params(void *tls_ctx,
 		data->openssl_ciphers = NULL;
 	}
 	if (params->openssl_ciphers &&
+#ifdef CONFIG_EAP_TEAPV2
 	    tls_set_cipher_string(ssl_ctx, NULL,
 				  params->openssl_ciphers) < 0) {
+#else /* CONFIG_EAP_TEAPV2 */
+	    SSL_CTX_set_cipher_list(ssl_ctx, params->openssl_ciphers) != 1) {
+		wpa_printf(MSG_INFO,
+			   "OpenSSL: Failed to set cipher string '%s'",
+			   params->openssl_ciphers);
+#endif /* CONFIG_EAP_TEAPV2 */
 		return -1;
 	}
 
@@ -6831,6 +6865,7 @@ bool tls_connection_get_own_cert_used(struct tls_connection *conn)
 }
 
 
+#ifdef CONFIG_EAP_TEAPV2
 struct wpabuf * tls_connection_get_own_cert(struct tls_connection *conn)
 {
 #if defined(EAP_FAST_OR_TEAP) || defined(CONFIG_SAE_PK)
@@ -6859,3 +6894,4 @@ struct wpabuf * tls_connection_get_own_cert(struct tls_connection *conn)
 	return NULL;
 #endif /* EAP_FAST_OR_TEAP || CONFIG_SAE_PK */
 }
+#endif /* CONFIG_EAP_TEAPV2 */

@@ -2385,6 +2385,8 @@ int tls_connection_get_failed(void *tls_ctx, struct tls_connection *conn)
 	return conn->failed;
 }
 
+
+#ifdef CONFIG_EAP_TEAPV2
 int tls_connection_peer_cert_validity(void *tls_ctx,
 				      struct tls_connection *conn,
 				      struct os_time *not_before,
@@ -2404,6 +2406,7 @@ struct wpabuf * tls_connection_sign_pkcs7(void *tls_ctx, const u8 *pkcs10,
 	(void) key_file;
 	return NULL;
 }
+#endif /* CONFIG_EAP_TEAPV2 */
 
 
 int tls_connection_get_read_alerts(void *tls_ctx, struct tls_connection *conn)
@@ -2450,6 +2453,8 @@ int tls_get_version(void *ssl_ctx, struct tls_connection *conn,
 	return 0;
 }
 
+
+#ifdef CONFIG_EAP_TEAPV2
 int tls_connection_peer_cert_issued_by(void *tls_ctx,
 				       struct tls_connection *conn,
 				       const char *issuer_cert)
@@ -2459,6 +2464,7 @@ int tls_connection_peer_cert_issued_by(void *tls_ctx,
 	(void) issuer_cert;
 	return -1;
 }
+#endif /* CONFIG_EAP_TEAPV2 */
 
 
 int tls_connection_get_random(void *ssl_ctx, struct tls_connection *conn,
@@ -2750,12 +2756,13 @@ tls_connection_get_success_data(struct tls_connection *conn)
 
 bool tls_connection_get_own_cert_used(struct tls_connection *conn)
 {
-	if (!conn)
-		return false;
-	return wolfSSL_get_certificate(conn->ssl) != NULL;
+	if (conn)
+		return wolfSSL_get_certificate(conn->ssl) != NULL;
+	return false;
 }
 
 
+#ifdef CONFIG_EAP_TEAPV2
 struct wpabuf * tls_connection_get_own_cert(struct tls_connection *conn)
 {
 	WOLFSSL_X509 *cert;
@@ -2773,3 +2780,4 @@ struct wpabuf * tls_connection_get_own_cert(struct tls_connection *conn)
 
 	return res;
 }
+#endif /* CONFIG_EAP_TEAPV2 */

@@ -541,7 +541,7 @@ NEED_AES_UNWRAP=y
 endif
 
 ifdef CONFIG_EAP_TEAPV2
-CFLAGS += -DEAP_SERVER_TEAPV2
+CFLAGS += -DCONFIG_EAP_TEAPV2 -DEAP_SERVER_TEAPV2
 OBJS += ../src/eap_server/eap_server_teapv2.o
 OBJS += ../src/eap_common/eap_teapv2_common.o
 TLS_FUNCS=y

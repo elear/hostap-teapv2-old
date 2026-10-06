@@ -2582,12 +2582,14 @@ static int hostapd_config_fill(struct hostapd_config *conf,
 	} else if (os_strcmp(buf, "private_key_passwd2") == 0) {
 		os_free(bss->private_key_passwd2);
 		bss->private_key_passwd2 = os_strdup(pos);
+#ifdef CONFIG_EAP_TEAPV2
 	} else if (os_strcmp(buf, "teapv2_pkcs7_cert") == 0) {
 		os_free(bss->teapv2_pkcs7_cert);
 		bss->teapv2_pkcs7_cert = os_strdup(pos);
 	} else if (os_strcmp(buf, "teapv2_pkcs7_key") == 0) {
 		os_free(bss->teapv2_pkcs7_key);
 		bss->teapv2_pkcs7_key = os_strdup(pos);
+#endif /* CONFIG_EAP_TEAPV2 */
 	} else if (os_strcmp(buf, "check_cert_subject") == 0) {
 		if (!pos[0]) {
 			wpa_printf(MSG_ERROR, "Line %d: unknown check_cert_subject '%s'",

@@ -842,6 +842,7 @@ endif
 
 ifdef CONFIG_EAP_TEAPV2
 # EAP-TEAPV2
+CFLAGS += -DCONFIG_EAP_TEAPV2
 SRC_EAP_TEAPV2 = ../src/eap_peer/eap_teapv2.c
 SRC_EAP_TEAPV2 += ../src/eap_common/eap_teapv2_common.c
 ifeq ($(CONFIG_EAP_TEAPV2), dyn)

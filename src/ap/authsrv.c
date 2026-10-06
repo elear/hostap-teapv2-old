@@ -334,6 +334,7 @@ static struct eap_config * authsrv_eap_config(struct hostapd_data *hapd)
 	cfg->eap_teap_separate_result = hapd->conf->eap_teap_separate_result;
 	cfg->eap_teap_id = hapd->conf->eap_teap_id;
 	cfg->eap_teap_method_sequence = hapd->conf->eap_teap_method_sequence;
+#ifdef CONFIG_EAP_TEAPV2
 	cfg->eap_teapv2_auth = hapd->conf->eap_teapv2_auth;
 	cfg->eap_teapv2_separate_result = hapd->conf->eap_teapv2_separate_result;
 	cfg->eap_teapv2_test_allow_keyless_inner =
@@ -358,6 +359,7 @@ static struct eap_config * authsrv_eap_config(struct hostapd_data *hapd)
 	if (hapd->conf->eap_teapv2_csrattrs)
 		cfg->eap_teapv2_csrattrs =
 			os_strdup(hapd->conf->eap_teapv2_csrattrs);
+#endif /* CONFIG_EAP_TEAPV2 */
 	cfg->eap_sim_aka_result_ind = hapd->conf->eap_sim_aka_result_ind;
 	cfg->eap_sim_id = hapd->conf->eap_sim_id;
 	cfg->imsi_privacy_key = hapd->imsi_privacy_key;
@@ -375,6 +377,7 @@ static struct eap_config * authsrv_eap_config(struct hostapd_data *hapd)
 		cfg->server_id = (u8 *) os_strdup("hostapd");
 		cfg->server_id_len = 7;
 	}
+#ifdef CONFIG_EAP_TEAPV2
 	if (hapd->conf->server_cert)
 		cfg->server_cert = os_strdup(hapd->conf->server_cert);
 	if (hapd->conf->private_key)
@@ -385,6 +388,7 @@ static struct eap_config * authsrv_eap_config(struct hostapd_data *hapd)
 	if (hapd->conf->teapv2_pkcs7_key)
 		cfg->teapv2_pkcs7_key =
 			os_strdup(hapd->conf->teapv2_pkcs7_key);
+#endif /* CONFIG_EAP_TEAPV2 */
 	cfg->erp = hapd->conf->eap_server_erp;
 #ifdef CONFIG_TESTING_OPTIONS
 	cfg->skip_prot_success = hapd->conf->eap_skip_prot_success;

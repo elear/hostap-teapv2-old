@@ -39,13 +39,20 @@ static void eap_server_tls_log_cb(void *ctx, const char *msg)
 #endif /* CONFIG_TLS_INTERNAL */
 
 
+#ifdef CONFIG_EAP_TEAPV2
 int eap_server_tls_ssl_init_flags(struct eap_sm *sm,
 				  struct eap_ssl_data *data,
 				  int verify_peer, int eap_type,
 				  unsigned int flags)
+#else /* CONFIG_EAP_TEAPV2 */
+int eap_server_tls_ssl_init(struct eap_sm *sm, struct eap_ssl_data *data,
+			    int verify_peer, int eap_type)
+#endif /* CONFIG_EAP_TEAPV2 */
 {
 	u8 session_ctx[8];
-	unsigned int conn_flags = flags;
+#ifndef CONFIG_EAP_TEAPV2
+	unsigned int flags = sm->cfg->tls_flags;
+#endif /* CONFIG_EAP_TEAPV2 */
 
 	if (!sm->cfg->ssl_ctx) {
 		wpa_printf(MSG_ERROR, "TLS context not initialized - cannot use TLS-based EAP method");
@@ -70,11 +77,11 @@ int eap_server_tls_ssl_init_flags(struct eap_sm *sm,
 #endif /* CONFIG_TLS_INTERNAL */
 
 	if (eap_type != EAP_TYPE_FAST)
-		conn_flags |= TLS_CONN_DISABLE_SESSION_TICKET;
+		flags |= TLS_CONN_DISABLE_SESSION_TICKET;
 	os_memcpy(session_ctx, "hostapd", 7);
 	session_ctx[7] = (u8) eap_type;
 	if (tls_connection_set_verify(sm->cfg->ssl_ctx, data->conn, verify_peer,
-				      conn_flags, session_ctx,
+				      flags, session_ctx,
 				      sizeof(session_ctx))) {
 		wpa_printf(MSG_INFO, "SSL: Failed to configure verification "
 			   "of TLS peer certificate");
@@ -101,12 +108,14 @@ int eap_server_tls_ssl_init_flags(struct eap_sm *sm,
 }
 
 
+#ifdef CONFIG_EAP_TEAPV2
 int eap_server_tls_ssl_init(struct eap_sm *sm, struct eap_ssl_data *data,
 			    int verify_peer, int eap_type)
 {
 	return eap_server_tls_ssl_init_flags(sm, data, verify_peer, eap_type,
 					     sm->cfg->tls_flags);
 }
+#endif /* CONFIG_EAP_TEAPV2 */
 
 
 void eap_server_tls_ssl_deinit(struct eap_sm *sm, struct eap_ssl_data *data)

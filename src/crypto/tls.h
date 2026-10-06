@@ -602,6 +602,7 @@ int __must_check tls_connection_client_hello_ext(void *tls_ctx,
  */
 int tls_connection_get_failed(void *tls_ctx, struct tls_connection *conn);
 
+#ifdef CONFIG_EAP_TEAPV2
 int tls_connection_peer_cert_validity(void *ssl_ctx,
 				      struct tls_connection *conn,
 				      struct os_time *not_before,
@@ -613,6 +614,7 @@ int tls_connection_peer_cert_issued_by(void *tls_ctx,
 struct wpabuf * tls_connection_sign_pkcs7(void *tls_ctx, const u8 *pkcs10,
 					  size_t len, const char *cert_file,
 					  const char *key_file);
+#endif /* CONFIG_EAP_TEAPV2 */
 
 /**
  * tls_connection_get_read_alerts - Get connection read alert status
@@ -702,6 +704,8 @@ const char * tls_connection_get_peer_subject(struct tls_connection *conn);
  */
 bool tls_connection_get_own_cert_used(struct tls_connection *conn);
 
+#ifdef CONFIG_EAP_TEAPV2
 struct wpabuf * tls_connection_get_own_cert(struct tls_connection *conn);
+#endif /* CONFIG_EAP_TEAPV2 */
 
 #endif /* TLS_H */

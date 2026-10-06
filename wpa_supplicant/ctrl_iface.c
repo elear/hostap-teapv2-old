@@ -278,6 +278,7 @@ static int wpas_ctrl_set_blob(struct wpa_supplicant *wpa_s, char *pos)
 	return 0;
 }
 
+#ifdef CONFIG_EAP_TEAPV2
 static int wpas_ctrl_list_blobs(struct wpa_supplicant *wpa_s, char *reply,
 				size_t reply_size)
 {
@@ -312,6 +313,7 @@ static int wpas_ctrl_get_blob(struct wpa_supplicant *wpa_s, const char *name,
 	os_memcpy(reply, blob->data, blob->len);
 	return blob->len;
 }
+#endif /* CONFIG_EAP_TEAPV2 */
 #endif /* CONFIG_NO_CONFIG_BLOBS */
 
 
@@ -14387,13 +14389,13 @@ char * wpa_supplicant_ctrl_iface_process(struct wpa_supplicant *wpa_s,
 		reply_len = wpa_supplicant_ctrl_iface_get_cred(wpa_s, buf + 9,
 							       reply,
 							       reply_size);
-#ifndef CONFIG_NO_CONFIG_BLOBS
+#if defined(CONFIG_EAP_TEAPV2) && !defined(CONFIG_NO_CONFIG_BLOBS)
 	} else if (os_strcmp(buf, "LIST_BLOBS") == 0) {
 		reply_len = wpas_ctrl_list_blobs(wpa_s, reply, reply_size);
 	} else if (os_strncmp(buf, "GET_BLOB ", 9) == 0) {
 		reply_len = wpas_ctrl_get_blob(wpa_s, buf + 9, reply,
 					       reply_size);
-#endif /* CONFIG_NO_CONFIG_BLOBS */
+#endif /* CONFIG_EAP_TEAPV2 && !CONFIG_NO_CONFIG_BLOBS */
 #ifndef CONFIG_NO_CONFIG_WRITE
 	} else if (os_strcmp(buf, "SAVE_CONFIG") == 0) {
 		if (wpa_supplicant_ctrl_iface_save_config(wpa_s))

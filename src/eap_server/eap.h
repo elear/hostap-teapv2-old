@@ -208,6 +208,7 @@ struct eap_config {
 		EAP_TEAP_ID_REQUIRE_USER_AND_MACHINE = 5,
 	} eap_teap_id;
 	int eap_teap_method_sequence;
+#ifdef CONFIG_EAP_TEAPV2
 	int eap_teapv2_auth;
 	int eap_teapv2_separate_result;
 	int eap_teapv2_test_allow_keyless_inner;
@@ -227,6 +228,7 @@ struct eap_config {
 	int eap_teapv2_request_action_pkcs10_untrusted;
 	char *eap_teapv2_trusted_server_root;
 	char *eap_teapv2_csrattrs;
+#endif /* CONFIG_EAP_TEAPV2 */
 
 	/**
 	 * eap_sim_aka_result_ind - EAP-SIM/AKA protected success indication
@@ -268,10 +270,12 @@ struct eap_config {
 	 */
 	u8 *server_id;
 	size_t server_id_len;
+#ifdef CONFIG_EAP_TEAPV2
 	char *server_cert;
 	char *private_key;
 	char *teapv2_pkcs7_cert;
 	char *teapv2_pkcs7_key;
+#endif /* CONFIG_EAP_TEAPV2 */
 
 	/**
 	 * erp - Whether EAP Re-authentication Protocol (ERP) is enabled

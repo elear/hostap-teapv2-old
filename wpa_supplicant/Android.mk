@@ -782,6 +782,7 @@ endif
 
 ifdef CONFIG_EAP_TEAPV2
 # EAP-TEAPV2
+L_CFLAGS += -DCONFIG_EAP_TEAPV2
 ifeq ($(CONFIG_EAP_TEAPV2), dyn)
 L_CFLAGS += -DEAP_TEAPV2_DYNAMIC
 EAPDYN += src/eap_peer/eap_teapv2.so
