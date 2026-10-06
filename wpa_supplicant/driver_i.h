@@ -315,12 +315,14 @@ static inline int wpa_drv_mlme_setprotection(struct wpa_supplicant *wpa_s,
 
 static inline struct hostapd_hw_modes *
 wpa_drv_get_hw_feature_data(struct wpa_supplicant *wpa_s, u16 *num_modes,
-			    u16 *flags, u8 *dfs_domain)
+			    u16 *flags, u8 *dfs_domain,
+			    char *alpha2, size_t alpha2_len)
 {
 	if (wpa_s->driver->get_hw_feature_data)
 		return wpa_s->driver->get_hw_feature_data(wpa_s->drv_priv,
 							  num_modes, flags,
-							  dfs_domain);
+							  dfs_domain,
+							  alpha2, alpha2_len);
 	return NULL;
 }
 
@@ -633,12 +635,12 @@ static inline int wpa_drv_driver_cmd(struct wpa_supplicant *wpa_s,
 static inline void wpa_drv_set_rekey_info(struct wpa_supplicant *wpa_s,
 					  const u8 *kek, size_t kek_len,
 					  const u8 *kck, size_t kck_len,
-					  const u8 *replay_ctr)
+					  const u8 *replay_ctr, int key_mgmt)
 {
 	if (!wpa_s->driver->set_rekey_info)
 		return;
 	wpa_s->driver->set_rekey_info(wpa_s->drv_priv, kek, kek_len,
-				      kck, kck_len, replay_ctr);
+				      kck, kck_len, replay_ctr, key_mgmt);
 }
 
 static inline int wpa_drv_radio_disable(struct wpa_supplicant *wpa_s,

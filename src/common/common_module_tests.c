@@ -177,7 +177,7 @@ static const struct rsn_ie_parse_test_data rsn_parse_tests[] = {
 	{ (u8 *) "\x30\x0d\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x00",
 	  15, -7 },
 	{ (u8 *) "\x30\x0e\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x00\x00",
-	  16, -6 },
+	  16, 0 },
 	{ (u8 *) "\x30\x0e\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x00\x01",
 	  16, -6 },
 	{ (u8 *) "\x30\x12\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x01",
@@ -735,7 +735,7 @@ static int pasn_test_no_pasn_auth(void)
 			     "Pairwise key expansion",
 			     spa, aa, snonce, anonce,
 			     &ptk, WPA_KEY_MGMT_SAE, WPA_CIPHER_CCMP,
-			     NULL, 0, WPA_KDK_MAX_LEN);
+			     NULL, 0, WPA_KDK_MAX_LEN, 19);
 
 	if (ret)
 		return ret;

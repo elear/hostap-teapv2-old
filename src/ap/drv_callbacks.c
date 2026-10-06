@@ -204,6 +204,8 @@ static int hostapd_update_sta_links_status(struct hostapd_data *hapd,
 		}
 
 		ie_len = 2 + subelem_defrag_len;
+		if ((size_t) num_frag_subelems * 2 > rem_len)
+			break;
 		rem_len -= num_frag_subelems * 2;
 
 		if (rem_len < ie_len)
@@ -648,7 +650,7 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
 					  elems.rsnxe ? elems.rsnxe_len + 2 : 0,
 					  elems.mdie, elems.mdie_len,
 					  elems.owe_dh, elems.owe_dh_len, NULL,
-					  ap_sta_is_mld(hapd, sta));
+					  ap_sta_is_mld(hapd, sta), NULL);
 		reason = WLAN_REASON_INVALID_IE;
 		status = WLAN_STATUS_INVALID_ELEMENT;
 		switch (res) {
@@ -744,12 +746,18 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
 		    sta->sae && !sta->sae->h2e &&
 		    ieee802_11_rsnx_capab_len(elems.rsnxe, elems.rsnxe_len,
 					      WLAN_RSNX_CAPAB_SAE_H2E)) {
-			wpa_printf(MSG_INFO, "SAE: " MACSTR
-				   " indicates support for SAE H2E, but did not use it",
-				   MAC2STR(sta->addr));
-			status = WLAN_STATUS_UNSPECIFIED_FAILURE;
-			reason = WLAN_REASON_UNSPECIFIED;
-			goto fail;
+			if (hapd->conf->sae_accept_h2e_without_use) {
+				wpa_printf(MSG_INFO, "SAE: " MACSTR
+					   " indicates support for SAE H2E, but did not use it - accepting due to sae_accept_h2e_without_use",
+					   MAC2STR(sta->addr));
+			} else {
+				wpa_printf(MSG_INFO, "SAE: " MACSTR
+					   " indicates support for SAE H2E, but did not use it",
+					   MAC2STR(sta->addr));
+				status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+				reason = WLAN_REASON_UNSPECIFIED;
+				goto fail;
+			}
 		}
 #endif /* CONFIG_SAE */
 
@@ -1527,10 +1535,9 @@ void hostapd_acs_channel_selected(struct hostapd_data *hapd,
 
 			if (mode->mode == acs_res->hw_mode) {
 				if (hapd->iface->freq > 0 &&
-				    !hw_get_chan(mode->mode,
-						 hapd->iface->freq,
-						 hapd->iface->hw_features,
-						 hapd->iface->num_hw_features))
+				    !hw_mode_get_channel(mode,
+							 hapd->iface->freq,
+							 NULL))
 					continue;
 				hapd->iface->current_mode = mode;
 				break;
@@ -1832,7 +1839,7 @@ static void hostapd_action_rx(struct hostapd_data *hapd,
 	}
 #endif /* CONFIG_DPP */
 #ifdef CONFIG_NAN_USD
-	if (mgmt->u.action.category == WLAN_ACTION_PUBLIC && plen >= 5 &&
+	if (mgmt->u.action.category == WLAN_ACTION_PUBLIC && plen >= 6 &&
 	    mgmt->u.action.u.vs_public_action.action ==
 	    WLAN_PA_VENDOR_SPECIFIC &&
 	    WPA_GET_BE24(mgmt->u.action.u.vs_public_action.oui) ==
@@ -2500,8 +2507,14 @@ static void hostapd_event_color_change(struct hostapd_data *hapd, bool success)
 		if (bss->cca_color == 0)
 			continue;
 
-		if (success)
+		if (success) {
 			hapd->iface->conf->he_op.he_bss_color = bss->cca_color;
+			/* Clear the disabled flag set during CCA so that
+			 * subsequent beacon rebuilds advertise the new color
+			 * as enabled.
+			 */
+			hapd->iface->conf->he_op.he_bss_color_disabled = 0;
+		}
 
 		bss->cca_in_progress = 0;
 		if (ieee802_11_set_beacon(bss)) {

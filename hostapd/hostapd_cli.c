@@ -21,7 +21,7 @@
 
 static const char *const hostapd_cli_version =
 "hostapd_cli v" VERSION_STR "\n"
-"Copyright (c) 2004-2024, Jouni Malinen <j@w1.fi> and contributors";
+"Copyright (c) 2004-2026, Jouni Malinen <j@w1.fi> and contributors";
 
 static struct wpa_ctrl *ctrl_conn;
 static int hostapd_cli_quit = 0;
@@ -882,6 +882,77 @@ static int hostapd_cli_cmd_send_qos_map_conf(struct wpa_ctrl *ctrl,
 }
 
 
+#ifdef CONFIG_ROBUST_AV
+
+static int hostapd_cli_cmd_set_dscp_policy(struct wpa_ctrl *ctrl,
+					   int argc, char *argv[])
+{
+	char cmd[512];
+	int res;
+	int i;
+	size_t total = 0;
+
+	if (argc < 2) {
+		printf("Invalid dscp_policy command\n"
+		       "usage: dscp_policy <sta_addr> <policy_id=> <request_type=> <dscp=>\n"
+		       "[classifier_mask=] [ip_version=] [src_ip=] [dst_ip=] [src_port=] [dst_port=]\n"
+		       "[protocol=] [domain_name=] [reset=]\n");
+		return -1;
+	}
+
+	res = os_snprintf(cmd, sizeof(cmd), "DSCP_POLICY");
+	if (os_snprintf_error(sizeof(cmd), res))
+		return -1;
+
+	total = res;
+
+	for (i = 0; i < argc; i++) {
+		res = os_snprintf(cmd + total, sizeof(cmd) - total, " %s",
+				  argv[i]);
+		if (os_snprintf_error(sizeof(cmd) - total, res)) {
+			printf("Too long DSCP_POLICY command.\n");
+			return -1;
+		}
+		total += res;
+	}
+
+	return wpa_ctrl_command(ctrl, cmd);
+}
+
+
+static int hostapd_cli_cmd_send_unsolicited_dscp_req(struct wpa_ctrl *ctrl,
+						     int argc, char *argv[])
+{
+	char cmd[512];
+	int res;
+	int i;
+	size_t total;
+
+	if (argc < 3) {
+		printf("Invalid send_unsolicited_dscp_req command\n"
+		       "usage: sta_addr=<addr> [reset=] [policy_id_list=]\n");
+		return -1;
+	}
+
+	res = os_snprintf(cmd, sizeof(cmd), "SEND_UNSOLICITED_DSCP_REQ");
+	if (os_snprintf_error(sizeof(cmd), res))
+		return -1;
+
+	total = res;
+	for (i = 0; i < argc; i++) {
+		res = os_snprintf(cmd + total, sizeof(cmd) - total, " %s",
+				  argv[i]);
+		if (os_snprintf_error(sizeof(cmd) - total, res))
+			return -1;
+		total += res;
+	}
+
+	return wpa_ctrl_command(ctrl, cmd);
+}
+
+#endif /* CONFIG_ROBUST_AV */
+
+
 static int hostapd_cli_cmd_hs20_wnm_notif(struct wpa_ctrl *ctrl, int argc,
 					  char *argv[])
 {
@@ -1283,6 +1354,7 @@ static int hostapd_cli_cmd_enable_mld(struct wpa_ctrl *ctrl, int argc,
 
 
 #ifdef CONFIG_TESTING_OPTIONS
+
 static int hostapd_cli_cmd_remove_link(struct wpa_ctrl *ctrl, int argc,
 				       char *argv[])
 {
@@ -1293,6 +1365,14 @@ static int hostapd_cli_cmd_remove_link(struct wpa_ctrl *ctrl, int argc,
 
 	return wpa_ctrl_command(ctrl, buf);
 }
+
+
+static int hostapd_cli_cmd_link_enable(struct wpa_ctrl *ctrl, int argc,
+				    char *argv[])
+{
+	return hostapd_cli_cmd(ctrl, "LINK_ENABLE", 1, argc, argv);
+}
+
 #endif /* CONFIG_TESTING_OPTIONS */
 
 
@@ -1685,6 +1765,31 @@ static int hostapd_cli_cmd_driver(struct wpa_ctrl *ctrl, int argc, char *argv[])
 #endif /* ANDROID */
 
 
+#ifdef CONFIG_AFC
+
+static int hostapd_cli_cmd_afc_get_request(struct wpa_ctrl *ctrl, int argc,
+					   char *argv[])
+{
+	return hostapd_cli_cmd(ctrl, "AFC_GET_REQUEST", 0, 0, NULL);
+}
+
+
+static int hostapd_cli_cmd_afc_get_response(struct wpa_ctrl *ctrl, int argc,
+					    char *argv[])
+{
+	return hostapd_cli_cmd(ctrl, "AFC_GET_RESPONSE", 0, 0, NULL);
+}
+
+
+static int hostapd_cli_cmd_afc_send_request(struct wpa_ctrl *ctrl, int argc,
+					    char *argv[])
+{
+	return hostapd_cli_cmd(ctrl, "AFC_SEND_REQUEST", 0, 0, NULL);
+}
+
+#endif /* CONFIG_AFC */
+
+
 struct hostapd_cli_cmd {
 	const char *cmd;
 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
@@ -1821,6 +1926,9 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
 #ifdef CONFIG_TESTING_OPTIONS
 	{ "remove_link", hostapd_cli_cmd_remove_link, NULL,
 	  "<count> = remove MLO link and send Reconfiguration MLE" },
+	{ "link_enable", hostapd_cli_cmd_link_enable, NULL,
+	  " bss_config=<phy>:<config file>\n"
+	  " = Enable a link previously removed from the MLD AP" },
 #endif /* CONFIG_TESTING_OPTIONS */
 	{ "disable_mld", hostapd_cli_cmd_disable_mld, NULL,
 	  "= disable AP MLD to which the interface is affiliated" },
@@ -1921,6 +2029,23 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
 	{ "driver", hostapd_cli_cmd_driver, NULL,
 	  "<driver sub command> [<hex formatted data>] = send driver command data" },
 #endif /* ANDROID */
+#ifdef CONFIG_ROBUST_AV
+	{"dscp_policy", hostapd_cli_cmd_set_dscp_policy, NULL,
+	 "<sta_addr> <policy_id=> <request_type=> <dscp=> [classifier_mask=]\n"
+	 "[ip_version=] [src_ip=] [dst_ip=] [src_port=] [dst_port=]\n"
+	 "[protocol=] [domain_name=] [reset=] = Set DSCP policy"},
+	{"send_unsolicited_dscp_req", hostapd_cli_cmd_send_unsolicited_dscp_req,
+	 NULL,
+	 "<addr>, [reset=], [policy_id_list=], Send unsolicited DSCP request"},
+#endif /* CONFIG_ROBUST_AV */
+#ifdef CONFIG_AFC
+	{ "afc_get_request", hostapd_cli_cmd_afc_get_request, NULL,
+	  " = Show latest AFC request data"},
+	{ "afc_get_response", hostapd_cli_cmd_afc_get_response, NULL,
+	  " = Show latest AFC response data"},
+	{ "afc_send_request", hostapd_cli_cmd_afc_send_request, NULL,
+	  " = Send another AFC request and upadte the timeout"},
+#endif /* CONFIG_AFC */
 	{ NULL, NULL, NULL, NULL }
 };
 

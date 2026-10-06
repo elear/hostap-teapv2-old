@@ -29,7 +29,7 @@
 
 static const char *const wpa_cli_version =
 "wpa_cli v" VERSION_STR "\n"
-"Copyright (c) 2004-2024, Jouni Malinen <j@w1.fi> and contributors";
+"Copyright (c) 2004-2026, Jouni Malinen <j@w1.fi> and contributors";
 
 #define VENDOR_ELEM_FRAME_ID \
 	"  0: Probe Req (P2P), 1: Probe Resp (P2P) , 2: Probe Resp (GO), " \
@@ -3310,6 +3310,13 @@ static int wpa_cli_cmd_pr_clear_dik_context(struct wpa_ctrl *ctrl, int argc,
 	return wpa_ctrl_command(ctrl, "PR_CLEAR_DIK_CONTEXT");
 }
 
+
+static int wpa_cli_cmd_pr_ranging_abort(struct wpa_ctrl *ctrl, int argc,
+					char *argv[])
+{
+	return wpa_ctrl_command(ctrl, "PR_RANGING_ABORT");
+}
+
 #endif /* CONFIG_PR */
 
 #endif /* CONFIG_PASN */
@@ -3489,6 +3496,13 @@ static int wpa_cli_cmd_nan_pair_abort(struct wpa_ctrl *ctrl, int argc,
 				      char *argv[])
 {
 	return wpa_cli_cmd(ctrl, "NAN_PAIR_ABORT", 1, argc, argv);
+}
+
+
+static int wpa_cli_cmd_nan_send_nik(struct wpa_ctrl *ctrl, int argc,
+				    char *argv[])
+{
+	return wpa_cli_cmd(ctrl, "NAN_SEND_NIK", 1, argc, argv);
 }
 
 #endif /* CONFIG_PASN */
@@ -4234,6 +4248,8 @@ static const struct wpa_cli_cmd wpa_cli_commands[] = {
 	  "self dik=<own_dik/peerdik> password=<global_pw/unique_pw> pmk=<pmk>" },
 	{ "pr_clear_dik_context", wpa_cli_cmd_pr_clear_dik_context, NULL,
 	  cli_cmd_flag_none, "= Clear all DIK contexts" },
+	{ "pr_ranging_abort", wpa_cli_cmd_pr_ranging_abort, NULL,
+	  cli_cmd_flag_none, "= Abort an ongoing proximity ranging session" },
 #endif /* CONFIG_PR */
 #endif /* CONFIG_PASN */
 	{ "mscs", wpa_cli_cmd_mscs, NULL,
@@ -4314,6 +4330,9 @@ static const struct wpa_cli_cmd wpa_cli_commands[] = {
 	{ "nan_pair_abort", wpa_cli_cmd_nan_pair_abort, NULL,
 	  cli_cmd_flag_none,
 	  " = <peer_mac> = Abort NAN pairing with peer" },
+	{ "nan_send_nik", wpa_cli_cmd_nan_send_nik, NULL,
+	  cli_cmd_flag_none,
+	  " = <peer_mac> = Send deferred NAN NIK follow-up to peer" },
 #endif /* CONFIG_PASN */
 #endif /* CONFIG_NAN */
 	{ "new_random_mac_address", wpa_cli_cmd_generate_new_mac, NULL,

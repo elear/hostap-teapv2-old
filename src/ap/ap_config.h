@@ -405,6 +405,7 @@ struct hostapd_bss_config {
 	char *rsn_preauth_interfaces;
 
 	int rsn_override_omit_rsnxe;
+	int rsn_override_mlo_compat;
 
 #ifdef CONFIG_IEEE80211R_AP
 	/* IEEE 802.11r - Fast BSS Transition */
@@ -504,6 +505,16 @@ struct hostapd_bss_config {
 
 	int wmm_enabled;
 	int wmm_uapsd;
+	bool wmm_override;
+
+	/*
+	 * WMM AC parameters, in same order as 802.1D, i.e.
+	 * 0 = BE (best effort)
+	 * 1 = BK (background)
+	 * 2 = VI (video)
+	 * 3 = VO (voice)
+	 */
+	struct hostapd_wmm_ac_params wmm_ac_params[4];
 
 	struct hostapd_vlan *vlan;
 
@@ -584,6 +595,10 @@ struct hostapd_bss_config {
 	bool disable_11ax;
 	bool disable_11be;
 	bool disable_11bn;
+
+#ifdef CONFIG_IEEE80211BE
+	bool bss_require_eht;
+#endif /* CONFIG_IEEE80211BE */
 
 	/* IEEE 802.11v */
 	int time_advertisement;
@@ -679,6 +694,12 @@ struct hostapd_bss_config {
 	int sae_require_mfp;
 	int sae_confirm_immediate;
 	enum sae_pwe sae_pwe;
+	/* Accept an SAE association even when the STA advertises SAE H2E
+	 * support in the RSNXE but authenticated using hunting-and-pecking.
+	 * This is a workaround for WPA3-Personal Compatibility Mode and
+	 * RSNXE-override interoperability (e.g., some MLO STAs that add only
+	 * the RSNXE Override element and do not use H2E on 2.4/5 GHz) */
+	bool sae_accept_h2e_without_use;
 	int *sae_groups;
 	struct sae_password_entry *sae_passwords;
 	int sae_password_psk;
@@ -697,6 +718,7 @@ struct hostapd_bss_config {
 	struct wpabuf *rsno2e_override;
 	struct wpabuf *rsnxe_override;
 	struct wpabuf *rsnxoe_override;
+	struct wpabuf *security_profile_override;
 	int sae_reflection_attack;
 	int sae_commit_status;
 	int sae_pk_omit;
@@ -1022,6 +1044,15 @@ struct hostapd_bss_config {
 	unsigned int pmksa_caching_privacy:1;
 	unsigned int eap_using_authentication_frames:1;
 #endif /* CONFIG_ENC_ASSOC  */
+#ifdef CONFIG_ROBUST_AV
+	bool enable_dscp_policy_capa;
+#endif /* CONFIG_ROBUST_AV */
+
+	unsigned int gas_max_peers;
+
+	int *security_profiles; /* -1 terminated array of enabled security
+				 * profiles */
+	u64 rsnxe_capab_mask;
 };
 
 /**
@@ -1132,15 +1163,6 @@ struct hostapd_config {
 	int spectrum_mgmt_required;
 
 	struct hostapd_tx_queue_params tx_queue[NUM_TX_QUEUES];
-
-	/*
-	 * WMM AC parameters, in same order as 802.1D, i.e.
-	 * 0 = BE (best effort)
-	 * 1 = BK (background)
-	 * 2 = VI (video)
-	 * 3 = VO (voice)
-	 */
-	struct hostapd_wmm_ac_params wmm_ac_params[4];
 
 	int ht_op_mode_fixed;
 	u16 ht_capab;
@@ -1290,6 +1312,47 @@ struct hostapd_config {
 
 	/* Disable MCS15 Subfield in EHT operation element */
 	bool disable_mcs15_rx;
+
+#ifdef CONFIG_AFC
+	struct {
+		char *socket;
+		struct {
+			char *version;
+			char *sn;
+		} request;
+		unsigned int n_cert_ids;
+		struct afc_cert_id {
+			char *ruleset;
+			char *id;
+		} *cert_ids;
+		struct {
+			enum afc_location_type {
+				AFC_ELLIPSE,
+				AFC_LINEAR_POLYGON,
+				AFC_RADIAL_POLYGON,
+			} type;
+			unsigned int n_linear_polygon_data;
+			struct afc_linear_polygon {
+				double longitude;
+				double latitude;
+			} *linear_polygon_data;
+			unsigned int n_radial_polygon_data;
+			struct afc_radial_polygon {
+				double length;
+				double angle;
+			} *radial_polygon_data;
+			int major_axis;
+			int minor_axis;
+			int orientation;
+			double height;
+			char *height_type;
+			int vertical_tolerance;
+		} location;
+		struct wpa_freq_range_list freqs;
+		int *op_class; /* int array */
+		int min_power;
+	} afc;
+#endif /* CONFIG_AFC */
 };
 
 
@@ -1419,6 +1482,7 @@ hostapd_set_and_check_bw320_offset(struct hostapd_config *conf,
 int hostapd_mac_comp(const void *a, const void *b);
 struct hostapd_config * hostapd_config_defaults(void);
 void hostapd_config_defaults_bss(struct hostapd_bss_config *bss);
+void hostapd_config_apply_wmm_override(struct hostapd_config *conf);
 void hostapd_config_free_radius_attr(struct hostapd_radius_attr *attr);
 void hostapd_config_free_eap_user(struct hostapd_eap_user *user);
 void hostapd_config_free_eap_users(struct hostapd_eap_user *user);
@@ -1452,5 +1516,9 @@ int hostapd_add_acl_maclist(struct mac_acl_entry **acl, int *num,
 void hostapd_remove_acl_mac(struct mac_acl_entry **acl, int *num,
 			    const u8 *addr);
 bool hostapd_config_check_bss_6g(struct hostapd_bss_config *bss);
+void hostapd_config_free_afc_cert_ids(struct hostapd_config *conf);
+int hostapd_config_sp_key_mgmt(const struct hostapd_bss_config *conf);
+int hostapd_config_all_key_mgmt(const struct hostapd_bss_config *conf);
+bool hostapd_config_sae_ext_key(const struct hostapd_bss_config *conf);
 
 #endif /* HOSTAPD_CONFIG_H */

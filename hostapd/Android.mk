@@ -604,7 +604,19 @@ endif
 ifdef CONFIG_NAN_USD
 OBJS += src/common/nan_de.c
 OBJS += src/ap/nan_usd_ap.c
+OBJS += src/nan/nan_crypto.c
 L_CFLAGS += -DCONFIG_NAN_USD
+endif
+
+ifdef CONFIG_PQC
+CONFIG_IEEE8021X_AUTH=y
+CONFIG_PMKSA_PRIVACY=y
+CONFIG_ENC_ASSOC=y
+L_CFLAGS += -DCONFIG_PQC
+NEED_HMAC_SHA384_KDF=y
+NEED_HMAC_SHA512_KDF=y
+NEED_SHA384=y
+NEED_SHA512=y
 endif
 
 ifdef CONFIG_PMKSA_PRIVACY
@@ -1001,12 +1013,15 @@ ifdef NEED_TLS_PRF_SHA384
 OBJS += src/crypto/sha384-tlsprf.c
 endif
 ifdef NEED_HMAC_SHA256_KDF
+L_CFLAGS += -DCONFIG_HMAC_SHA256_KDF
 OBJS += src/crypto/sha256-kdf.c
 endif
 ifdef NEED_HMAC_SHA384_KDF
+L_CFLAGS += -DCONFIG_HMAC_SHA384_KDF
 OBJS += src/crypto/sha384-kdf.c
 endif
 ifdef NEED_HMAC_SHA512_KDF
+L_CFLAGS += -DCONFIG_HMAC_SHA512_KDF
 OBJS += src/crypto/sha512-kdf.c
 endif
 ifdef NEED_SHA384
@@ -1177,6 +1192,11 @@ endif
 ifdef CONFIG_PROCESS_COORDINATION
 L_CFLAGS += -DCONFIG_PROCESS_COORDINATION
 OBJS += src/common/proc_coord.c
+endif
+
+ifdef CONFIG_ROBUST_AV
+L_CFLAGS += -DCONFIG_ROBUST_AV
+OBJS += src/ap/robust_av.c
 endif
 
 OBJS_c = hostapd_cli.c

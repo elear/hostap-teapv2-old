@@ -48,6 +48,8 @@ struct nl80211_global {
 
 	/* pending events that happened while waiting for a sync reply */
 	struct dl_list pending_events;
+	/* set while nl80211_deliver_pending_events() is running */
+	bool delivering_pending_events;
 #ifdef CONFIG_NAN
 	/* Dedicated socket for NAN interface creation and events */
 	struct nl_sock *nl_nan;
@@ -387,7 +389,7 @@ int nl80211_send_monitor(struct wpa_driver_nl80211_data *drv,
 int wpa_driver_nl80211_capa(struct wpa_driver_nl80211_data *drv);
 struct hostapd_hw_modes *
 nl80211_get_hw_feature_data(void *priv, u16 *num_modes, u16 *flags,
-			    u8 *dfs_domain);
+			    u8 *dfs_domain, char *alpha2, size_t alpha2_len);
 
 int process_global_event(struct nl_msg *msg, void *arg);
 int process_bss_event(struct nl_msg *msg, void *arg);
@@ -398,7 +400,8 @@ void nl80211_restore_ap_mode(struct i802_bss *bss);
 struct i802_link * nl80211_get_link(struct i802_bss *bss, s8 link_id);
 u8 nl80211_get_link_id_from_link(struct i802_bss *bss, struct i802_link *link);
 int nl80211_remove_link(struct i802_bss *bss, int link_id);
-void nl80211_update_active_links(struct i802_bss *bss, int link_id);
+void nl80211_update_active_links(struct i802_bss *bss, int link_id,
+				 bool set_active_links);
 int nl80211_has_ifidx(struct wpa_driver_nl80211_data *drv, int ifidx,
 		      int ifidx_reason);
 

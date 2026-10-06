@@ -511,7 +511,7 @@ CONFIG_IEEE80211AX=y
 CONFIG_IEEE80211BE=y
 
 # Wireless Network Management (IEEE Std 802.11v-2011)
-#CONFIG_WNM=y
+CONFIG_WNM=y
 
 # Interworking (IEEE 802.11u)
 # This can be used to enable functionality to improve interworking with
@@ -604,7 +604,7 @@ CONFIG_WIFI_DISPLAY=y
 #CONFIG_ACS=y
 
 # Support Multi Band Operation
-#CONFIG_MBO=y
+CONFIG_MBO=y
 
 # Fast Initial Link Setup (FILS) (IEEE 802.11ai)
 #CONFIG_FILS=y
@@ -699,3 +699,21 @@ CONFIG_DPP2=y
 # IEEE P802.11bi/D4.0, 12.16.5 (IEEE 802.1X authentication utilizing
 # Authentication frames)
 #CONFIG_IEEE8021X_AUTH=y
+
+# Maximum number of pending ctrl_iface monitor messages to queue before
+# dropping the oldest. Default is 2000. Embedded platforms with limited
+# memory may benefit from a lower value (e.g., 100).
+#CONFIG_CTRL_IFACE_MSG_QUEUE_LIMIT=2000
+
+# OpenSSL PKCS#11/OpenSC engine and module trusted-path validation
+# Validate PKCS#11 engine, PKCS#11 module, and OpenSC engine shared library
+# paths (root-owned, non-writable regular file under /usr/lib with root-owned
+# ancestor directories) before dlopen()ing them. Disabled by default to avoid
+# affecting deployments that run wpa_supplicant as a non-root user with shared
+# libraries in a custom directory owned by that user.
+#CONFIG_TLS_ENGINE_TRUSTED_PATH=y
+
+# Post quantum cryptography (IEEE P802.11bt)
+# Note: These features are experimental and still changing; do not enable for
+# production use.
+#CONFIG_PQC=y

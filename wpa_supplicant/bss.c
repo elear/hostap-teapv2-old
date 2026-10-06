@@ -854,6 +854,12 @@ wpa_bss_update(struct wpa_supplicant *wpa_s, struct wpa_bss *bss,
 		bool update_current_bss = wpa_s->current_bss == bss;
 		bool update_ml_probe_bss = wpa_s->ml_connect_probe_bss == bss;
 		int update_link_bss = -1;
+#ifdef CONFIG_WNM
+		bool update_wnm_target = wpa_s->wnm_target_bss == bss;
+#endif /* CONFIG_WNM */
+#ifdef CONFIG_INTERWORKING
+		bool update_interworking = wpa_s->interworking_gas_bss == bss;
+#endif /* CONFIG_INTERWORKING */
 
 		for (j = 0; j < MAX_NUM_MLD_LINKS; j++) {
 			if (wpa_s->links[j].bss == bss) {
@@ -884,6 +890,15 @@ wpa_bss_update(struct wpa_supplicant *wpa_s, struct wpa_bss *bss,
 
 			if (update_link_bss >= 0)
 				wpa_s->links[update_link_bss].bss = nbss;
+
+#ifdef CONFIG_WNM
+			if (update_wnm_target)
+				wpa_s->wnm_target_bss = nbss;
+#endif /* CONFIG_WNM */
+#ifdef CONFIG_INTERWORKING
+			if (update_interworking)
+				wpa_s->interworking_gas_bss = nbss;
+#endif /* CONFIG_INTERWORKING */
 
 			if (cwork)
 				wpa_bss_update_pending_connect(cwork, nbss);
@@ -1744,6 +1759,43 @@ wpa_bss_validate_rsne_ml(struct wpa_supplicant *wpa_s, struct wpa_ssid *ssid,
 		return false;
 	}
 
+	/*
+	 * Security Profile element preference (IEEE P802.11bn/D2.0, 37.33):
+	 * If this link's AP advertises a Security Profile element whose
+	 * profile number implies an AKM/cipher that matches the STA's
+	 * config, augment wpa_ie.key_mgmt/pairwise_cipher so the checks below
+	 * pass even when the RSNE/RSNOE/RSNO2E does not explicitly list those
+	 * values. Without this, an AP MLD that only advertises CCMP/legacy AKMs
+	 * in its RSNE but supports GCMP-256 via a Security Profile would have
+	 * this link (and potentially all links, since they share the same
+	 * requirement) wrongly excluded from the usable-links bitmap.
+	 */
+	if (wpas_security_profile_active(wpa_s)) {
+		const u8 *sp;
+		int sp_key_mgmt;
+
+		sp = wpa_bss_get_ie_ext(bss, WLAN_EID_EXT_SECURITY_PROFILE);
+
+		sp_key_mgmt = security_profile_get_key_mgmt(sp, ssid->key_mgmt);
+		if (!sp_key_mgmt ||
+		    !(ssid->pairwise_cipher & WPA_CIPHER_GCMP_256))
+			goto no_sp_match;
+
+		if (!(wpa_ie.pairwise_cipher & WPA_CIPHER_GCMP_256)) {
+			wpa_dbg(wpa_s, MSG_DEBUG,
+				"MLD: Security Profile element overrides RSNE pairwise cipher (GCMP-256)");
+			wpa_ie.pairwise_cipher |= WPA_CIPHER_GCMP_256;
+		}
+
+		if (!(wpa_ie.key_mgmt & ssid->key_mgmt)) {
+			wpa_dbg(wpa_s, MSG_DEBUG,
+				"MLD: Security Profile element overrides RSN element AKM (key_mgmt=0x%x)",
+				sp_key_mgmt);
+			wpa_ie.key_mgmt |= sp_key_mgmt;
+		}
+	no_sp_match:
+	}
+
 	wpa_ie.key_mgmt &= ~(WPA_KEY_MGMT_PSK | WPA_KEY_MGMT_FT_PSK |
 			     WPA_KEY_MGMT_PSK_SHA256);
 	if (!(wpa_ie.key_mgmt & ssid->key_mgmt)) {
@@ -1782,6 +1834,20 @@ wpa_bss_validate_rsne_ml(struct wpa_supplicant *wpa_s, struct wpa_ssid *ssid,
 }
 
 
+/*
+ * SME-based association with an AP MLD requires the driver to have a
+ * sufficiently recent scan entry for every requested link. With nl80211-based
+ * drivers, cfg80211 rejects the association if the BSS entry for any link is
+ * older than 30 seconds (IEEE80211_SCAN_RESULT_EXPIRE). Since the BSS table in
+ * wpa_supplicant keeps entries considerably longer than that
+ * (bss_expiration_age, 180 seconds by default) and does not refresh entries for
+ * the links of the current AP MLD while associated, consider an affiliated link
+ * with an older scan entry to be missing so that an ML probe request gets used
+ * to refresh the information before association. Leave some margin below the
+ * kernel limit to cover the time needed for authentication.
+ */
+#define WPA_BSS_ML_LINK_FRESH_AGE 25 /* seconds */
+
 /**
  * wpa_bss_get_usable_links - Retrieve the usable links of the AP MLD
  * @wpa_s: Pointer to wpa_supplicant data
@@ -1797,12 +1863,15 @@ u16 wpa_bss_get_usable_links(struct wpa_supplicant *wpa_s, struct wpa_bss *bss,
 			     struct wpa_ssid *ssid, u16 *missing_links)
 {
 	struct wpa_ie_data rsne;
+	struct os_reltime now;
 	int rsne_type;
 	u16 usable_links = 0;
 	u8 link_id;
 
 	if (!bss->valid_links)
 		return 0;
+
+	os_get_reltime(&now);
 
 	rsne_type = -1;
 	os_memset(&rsne, 0, sizeof(rsne));
@@ -1831,6 +1900,17 @@ u16 wpa_bss_get_usable_links(struct wpa_supplicant *wpa_s, struct wpa_bss *bss,
 						      bss->mld_links[link_id].bssid);
 
 		if (!neigh_bss) {
+			if (missing_links)
+				*missing_links |= BIT(link_id);
+			continue;
+		}
+
+		if (os_reltime_expired(&now, &neigh_bss->last_update,
+				       WPA_BSS_ML_LINK_FRESH_AGE)) {
+			wpa_dbg(wpa_s, MSG_DEBUG,
+				"MLD: Scan entry for neighbor " MACSTR
+				" is too old for association; consider link %u missing",
+				MAC2STR(neigh_bss->bssid), link_id);
 			if (missing_links)
 				*missing_links |= BIT(link_id);
 			continue;
@@ -2233,6 +2313,8 @@ u16 wpa_bss_parse_reconf_ml_element(struct wpa_supplicant *wpa_s,
 			break;
 		}
 
+		if ((size_t) num_frag_subelems * 2 > len)
+			goto out;
 		len -= num_frag_subelems * 2;
 
 		if (2 + sub_elem_len > len) {

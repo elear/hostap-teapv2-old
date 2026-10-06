@@ -189,6 +189,14 @@ static int eap_ttls_avp_parse(struct wpabuf *buf, struct eap_ttls_avp *parse)
 		u32 avp_code, avp_length, vendor_id = 0;
 		u8 avp_flags, *dpos;
 		size_t pad, dlen;
+
+		if (left < (int) sizeof(*avp)) {
+			wpa_printf(MSG_WARNING,
+				   "EAP-TTLS: Truncated AVP (left=%d < %zu)",
+				   left, sizeof(*avp));
+			goto fail;
+		}
+
 		avp = (struct ttls_avp *) pos;
 		avp_code = be_to_host32(avp->avp_code);
 		avp_length = be_to_host32(avp->avp_length);
@@ -1221,7 +1229,7 @@ static void eap_ttls_process(struct eap_sm *sm, void *priv,
 		return;
 
 	buf = tls_connection_get_success_data(data->ssl.conn);
-	if (!buf || wpabuf_len(buf) < 1) {
+	if (!buf || wpabuf_len(buf) < 2) {
 		wpa_printf(MSG_DEBUG,
 			   "EAP-TTLS: No success data in resumed session - reject attempt");
 		eap_ttls_state(data, FAILURE);
@@ -1239,6 +1247,11 @@ static void eap_ttls_process(struct eap_sm *sm, void *priv,
 
 	pos++;
 	id_len = *pos++;
+	if (wpabuf_len(buf) < 2U + id_len) {
+		/* Invalid cached data */
+		eap_ttls_state(data, FAILURE);
+		return;
+	}
 	wpa_hexdump_ascii(MSG_DEBUG, "EAP-TTLS: Identity from cached session",
 			  pos, id_len);
 	os_free(sm->identity);

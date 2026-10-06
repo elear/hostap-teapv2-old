@@ -56,6 +56,9 @@ static int sme_validate_basic_mle(const struct ieee802_11_elems *elems,
 static void sme_process_802_1x_auth_response(struct wpa_supplicant *wpa_s,
 					     struct auth_info *auth,
 					     bool external);
+#endif /* CONFIG_IEEE8021X_AUTH */
+
+#if defined(CONFIG_IEEE8021X_AUTH) || defined(CONFIG_ENC_ASSOC)
 
 static const u8 * sme_get_peer_addr(struct wpa_supplicant *wpa_s, bool external)
 {
@@ -66,6 +69,31 @@ static const u8 * sme_get_peer_addr(struct wpa_supplicant *wpa_s, bool external)
 	return wpa_s->valid_links ? wpa_s->ap_mld_addr : wpa_s->pending_bssid;
 }
 
+
+const u8 * sme_get_ext_auth_pmkid(struct wpa_supplicant *wpa_s)
+{
+	struct rsn_pmksa_cache *cache;
+	struct rsn_pmksa_cache_entry *entry;
+	const u8 *peer;
+
+	peer = sme_get_peer_addr(wpa_s, true);
+	if (!peer)
+		return NULL;
+
+	cache = wpa_sm_get_pmksa_cache(wpa_s->wpa);
+	if (!cache)
+		return NULL;
+
+	entry = pmksa_cache_get(cache, peer, wpa_s->own_addr, NULL,
+				wpa_s->sme.ext_auth_wpa_ssid,
+				wpa_s->sme.ext_auth_key_mgmt);
+	return entry ? entry->pmkid : NULL;
+}
+
+#endif /* CONFIG_IEEE8021X_AUTH || CONFIG_ENC_ASSOC */
+
+
+#ifdef CONFIG_IEEE8021X_AUTH
 
 static int sme_get_key_mgmt(struct wpa_supplicant *wpa_s, bool external)
 {
@@ -83,6 +111,66 @@ static int sme_get_pairwise_cipher(struct wpa_supplicant *wpa_s, bool external)
 static bool sme_is_ml_auth(struct wpa_supplicant *wpa_s, bool external)
 {
 	return external ? wpa_s->sme.ext_ml_auth : wpa_s->valid_links;
+}
+
+
+static int sme_get_pmk_for_1x_auth(struct wpa_supplicant *wpa_s,
+				    const u8 *pmkid, bool external,
+				    u8 *pmk_buf, size_t *pmk_len)
+{
+	struct rsn_pmksa_cache *pmksa_cache;
+	struct rsn_pmksa_cache_entry *entry;
+	const u8 *peer_addr;
+	struct wpa_ssid *ssid;
+	int key_mgmt;
+	size_t len;
+	int res;
+
+	peer_addr = sme_get_peer_addr(wpa_s, external);
+	key_mgmt = sme_get_key_mgmt(wpa_s, external);
+	ssid = wpa_s->sme.ext_auth_wpa_ssid ?
+		wpa_s->sme.ext_auth_wpa_ssid : wpa_s->current_ssid;
+
+	pmksa_cache = wpa_sm_get_pmksa_cache(wpa_s->wpa);
+	if (!pmksa_cache) {
+		wpa_msg(wpa_s, MSG_DEBUG,
+			"IEEE 802.1X: No PMKSA cache available");
+		return -1;
+	}
+
+	if (pmkid) {
+		entry = pmksa_cache_get(pmksa_cache, peer_addr,	wpa_s->own_addr,
+					pmkid, ssid, key_mgmt);
+		if (!entry) {
+			wpa_msg(wpa_s, MSG_DEBUG,
+				"IEEE 802.1X: No PMKSA cache entry found for the given PMKID");
+			return -1;
+		}
+
+		os_memcpy(pmk_buf, entry->pmk, entry->pmk_len);
+		*pmk_len = entry->pmk_len;
+		return 0;
+	}
+
+	if (wpa_key_mgmt_sha384(key_mgmt))
+		len = PMK_LEN_SUITE_B_192;
+	else
+		len = PMK_LEN;
+
+	res = eapol_sm_get_key(wpa_s->eapol, pmk_buf, len);
+	if (res) {
+		wpa_msg(wpa_s, MSG_INFO,
+			"IEEE 802.1X: Failed to get MSK from EAP state machine");
+		return -1;
+	}
+
+	*pmk_len = len;
+
+	pmksa_cache_add(pmksa_cache, pmk_buf, len, NULL, NULL, 0, peer_addr,
+			wpa_s->own_addr, ssid, key_mgmt, NULL,
+			WLAN_AUTH_802_1X);
+
+	return 0;
 }
 
 #endif /* CONFIG_IEEE8021X_AUTH */
@@ -246,6 +334,26 @@ static struct wpabuf * sme_auth_build_sae_commit(struct wpa_supplicant *wpa_s,
 			rsnxe_capa = rsnxe[2 + 4];
 		else if (rsnxe && rsnxe[1] >= 1)
 			rsnxe_capa = rsnxe[2];
+
+		/*
+		 * Security Profile element preference (IEEE P802.11bn/D2.0,
+		 * 37.33):
+		 * The Extended RSN Capabilities in the Security Profile element
+		 * take precedence over the RSNXE/RSNXOE. Merge the security
+		 * profile's RSNX capabilities related to SAE into rsnxe_capa so
+		 * that SAE H2E and SAE-PK checks below use the security
+		 * profile values.
+		 */
+		if (wpas_security_profile_active(wpa_s)) {
+			const u8 *sp_rsnx;
+			size_t sp_rsnx_len;
+			const u8 *sp = wpa_bss_get_ie_ext(
+				bss, WLAN_EID_EXT_SECURITY_PROFILE);
+
+			sp_rsnx = security_profile_get_rsnx(sp, &sp_rsnx_len);
+			if (sp_rsnx && sp_rsnx_len >= 1)
+				rsnxe_capa |= sp_rsnx[0] & 0xF0;
+		}
 	}
 
 	sae_pwe = wpas_get_ssid_sae_pwe(wpa_s, ssid);
@@ -258,6 +366,9 @@ static struct wpabuf * sme_auth_build_sae_commit(struct wpa_supplicant *wpa_s,
 		use_pt = 1;
 	if (bss && is_6ghz_freq(bss->freq) &&
 	    sae_pwe != SAE_PWE_FORCE_HUNT_AND_PECK)
+		use_pt = 1;
+	if (wpa_s->sel_security_profile &&
+	    wpa_key_mgmt_sae_ext_key(wpa_s->sel_security_profile->key_mgmt))
 		use_pt = 1;
 #ifdef CONFIG_SAE_PK
 	if ((rsnxe_capa & BIT(WLAN_RSNX_CAPAB_SAE_PK)) &&
@@ -435,12 +546,14 @@ sme_build_802_1x_for_ptk(struct wpa_supplicant *wpa_s, bool external)
 	/* Generate RSNE */
 	if (external)
 		rsne_len = wpa_external_auth_add_rsne(
+			wpa_s->wpa,
 			wpa_s->auth_1x->rsne, sizeof(wpa_s->auth_1x->rsne),
-			wpa_s->wpa, wpa_s->sme.ext_auth_key_mgmt,
+			wpa_s->sme.ext_auth_key_mgmt,
 			wpa_s->sme.ext_pairwise_cipher,
 			wpa_s->sme.ext_group_cipher,
 			wpa_s->sme.ext_mgmt_group_cipher,
-			wpa_s->sme.ext_rsn_capab);
+			wpa_s->sme.ext_rsn_capab,
+			sme_get_ext_auth_pmkid(wpa_s));
 	else
 		rsne_len = wpa_gen_wpa_ie_rsn(
 			wpa_s->auth_1x->rsne, sizeof(wpa_s->auth_1x->rsne),
@@ -502,12 +615,119 @@ fail:
 }
 
 
+static size_t sme_802_1x_auth_start_sec_prof(struct wpa_supplicant *wpa_s,
+					     bool external)
+{
+	int key_mgmt = sme_get_key_mgmt(wpa_s, external);
+	const u8 *sp_ap;
+	struct wpa_bss *sp_bss;
+	u8 bitmap_len;
+	const u8 *bitmap;
+	int ret;
+	const struct security_profile_entry *profile;
+
+	/*
+	 * Security Profile element is included only when the RSNE is present in
+	 * the Authentication frame. For 802.1X, the RSNE is present only in the
+	 * derive_ptk path (via the PTK sub-frame built by
+	 * sme_build_802_1x_for_ptk()). Per IEEE P802.11bn/D2.0, 37.33, do not
+	 * include the Security Profile element when derive_ptk=false (no RSNE
+	 * in the frame).
+	 *
+	 * SME-in-wpa_supplicant path: The Security Profile element was
+	 * pre-built by wpa_supplicant_set_suites() from the negotiated AKM and
+	 * cipher and stored in wpa_s->security_profile.
+	 *
+	 * External auth path: wpa_supplicant_set_suites() is not called, so
+	 * selected_security_profile_num is -1. Derive the profile number from
+	 * the driver-provided parameters (key_mgmt, ext_pairwise_cipher) by
+	 * scanning the AP's Security Profile Bitmap,
+	 * using security_profile_select_num() with eap_over_auth=true
+	 * (derive_ptk is already confirmed true at this point).
+	 *
+	 * Conditions to include the Security Profile element:
+	 *   1. Security profile support is active
+	 *   2. AP is advertising the Security Profile element
+	 *   3. A matching profile number is available (pre-built or derived)
+	 */
+	if (!wpa_s->auth_1x->derive_ptk ||
+	    !wpas_security_profile_active(wpa_s))
+		return 0;
+
+	sp_bss = external ?
+		wpa_bss_get_bssid_latest(wpa_s, wpa_s->sme.ext_auth_bssid) :
+		wpa_s->current_bss;
+
+	sp_ap = sp_bss ?
+		wpa_bss_get_ie_ext(sp_bss, WLAN_EID_EXT_SECURITY_PROFILE) :
+		NULL;
+
+	if (sp_ap &&
+	    wpa_s->sel_security_profile &&
+	    wpa_s->security_profile_len > 0) {
+		/* SME-in-wpa_supplicant: use pre-built Security Profile
+		 * element */
+		return wpa_s->security_profile_len;
+	}
+
+	if (!external || !sp_ap || sp_ap[1] < 3)
+		return 0;
+
+	/*
+	 * External auth path: build Security Profile element from
+	 * driver-provided AKM and pairwise cipher. eap_over_auth=true because
+	 * derive_ptk is confirmed.
+	 */
+	bitmap_len = sp_ap[4] & 0x0F;
+	if (sp_ap[1] < 3 + bitmap_len)
+		return 0;
+
+	bitmap = sp_ap + 5;
+
+	if (wpa_s->sel_security_profile)
+		profile = wpa_s->sel_security_profile;
+	else
+		profile = security_profile_select(
+			key_mgmt,
+			wpa_s->sme.ext_pairwise_cipher, true,
+			false, bitmap, bitmap_len);
+	if (!profile)
+		return 0;
+
+	/*
+	 * Build the Security Profile element from the actual driver-negotiated
+	 * RSN Capabilities (wpa_s->sme.ext_rsn_capab) and the RSNXE
+	 * (wpa_s->sme.ext_rsnxe), not from wpa_s->wpa state, since wpa_sm_*
+	 * fields are not populated/updated for external auth. This guarantees
+	 * the element's Reduced/Extended RSN Capabilities fields match exactly
+	 * what is placed in the RSNE/RSNXE actually sent in
+	 * sme_build_802_1x_for_ptk() via wpa_external_auth_add_rsne() and the
+	 * copied ext_rsnxe buffer (IEEE P802.11bn/D2.0, 9.4.2.369).
+	 */
+	ret = security_profile_build(
+		wpa_s->sme.ext_rsn_capab,
+		wpa_s->sme.ext_rsnxe_len > 0 ? wpa_s->sme.ext_rsnxe : NULL,
+		wpa_s->sme.ext_rsnxe_len, profile->number,
+		wpa_s->security_profile, sizeof(wpa_s->security_profile));
+	if (ret <= 0)
+		return 0;
+
+	wpa_s->security_profile_len = ret;
+	wpa_s->sel_security_profile = profile;
+	wpa_sm_set_security_profile(wpa_s->wpa, profile);
+	wpa_printf(MSG_DEBUG,
+		   "IEEE 802.1X: External auth: Security Profile element built (profile=%d)",
+		   profile->number);
+	return wpa_s->security_profile_len;
+}
+
+
 static struct wpabuf * sme_build_802_1x_auth_start(struct wpa_supplicant *wpa_s,
 						   struct wpa_ssid *ssid,
 						   bool external)
 {
 	struct wpabuf *buf, *eapol_pdu;
-	size_t buf_len;
+	size_t buf_len, sp_len;
 	u32 suite = 0;
 	struct wpabuf *buf_for_ptk = NULL;
 	int key_mgmt = sme_get_key_mgmt(wpa_s, external);
@@ -525,6 +745,12 @@ static struct wpabuf * sme_build_802_1x_auth_start(struct wpa_supplicant *wpa_s,
 	if (!eapol_pdu)
 		return NULL;
 
+	sp_len = sme_802_1x_auth_start_sec_prof(wpa_s, external);
+#ifdef CONFIG_TESTING_OPTIONS
+	if (wpa_s->sec_prof_override_auth)
+		sp_len = wpabuf_len(wpa_s->sec_prof_override_auth);
+#endif /* CONFIG_TESTING_OPTIONS */
+
 	buf_len = 2 + 2 + 2 + wpabuf_len(eapol_pdu);
 
 	if (wpa_s->auth_1x->derive_ptk) {
@@ -537,6 +763,8 @@ static struct wpabuf * sme_build_802_1x_auth_start(struct wpa_supplicant *wpa_s,
 	} else {
 		buf_len += 7; /* AKM Suite Selector element */
 	}
+
+	buf_len += sp_len;
 
 	buf = wpabuf_alloc(buf_len);
 	if (!buf) {
@@ -558,6 +786,20 @@ static struct wpabuf * sme_build_802_1x_auth_start(struct wpa_supplicant *wpa_s,
 		wpabuf_put_u8(buf, 1 + 4);
 		wpabuf_put_u8(buf, WLAN_EID_EXT_AKM_SUITE_SELECTOR);
 		wpabuf_put_be32(buf, suite);
+	}
+
+#ifdef CONFIG_TESTING_OPTIONS
+	if (wpa_s->sec_prof_override_auth) {
+		wpa_printf(MSG_DEBUG,
+			   "TESTING: Security Profile element Auth override");
+		wpabuf_put_buf(buf, wpa_s->sec_prof_override_auth);
+	} else
+#endif /* CONFIG_TESTING_OPTIONS */
+	if (sp_len > 0 && wpa_s->sel_security_profile) {
+		wpabuf_put_data(buf, wpa_s->security_profile, sp_len);
+		wpa_printf(MSG_DEBUG,
+			   "IEEE 802.1X: Including Security Profile element in auth start frame (profile=%d)",
+			   wpa_s->sel_security_profile->number);
 	}
 
 	wpabuf_free(eapol_pdu);
@@ -609,16 +851,20 @@ static void sme_check_802_1x_pmksa_caching(struct wpa_supplicant *wpa_s,
 					   bool external)
 {
 	struct rsn_pmksa_cache_entry *pmksa;
-	const u8 *rsnxe, *peer_addr;
+	const u8 *peer_addr;
 	int key_mgmt;
+
+	if (!bss)
+		return;
 
 	peer_addr = sme_get_peer_addr(wpa_s, external);
 	key_mgmt = sme_get_key_mgmt(wpa_s, external);
 
-	rsnxe = wpa_bss_get_ie(bss, WLAN_EID_RSNX);
-	if (ssid->eap_over_auth_frame &&
-	    ieee802_11_rsnx_capab(rsnxe,
-				  WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION) &&
+	if ((ssid->eap_over_auth_frame ||
+	     (wpas_security_profile_active(wpa_s) &&
+	      sec_prof_list_has_eap_over_auth(ssid->security_profiles))) &&
+	    wpas_eppke_ap_rsnx_capab(wpa_s, bss,
+				     WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION) &&
 	    (wpa_s->drv_flags2 &
 	     WPA_DRIVER_FLAGS2_ASSOCIATION_FRAME_ENCRYPTION))
 		wpa_s->auth_1x->derive_ptk = true;
@@ -922,43 +1168,6 @@ static void sme_add_assoc_req_ie(struct wpa_supplicant *wpa_s,
 
 #ifdef CONFIG_ENC_ASSOC
 
-static bool wpas_eppke_ap_capable(struct wpa_supplicant *wpa_s,
-				  struct wpa_bss *bss, bool unauth_eppke)
-{
-	const u8 *ap_rsnxe;
-
-	if (!(wpa_s->drv_flags2 &
-	      WPA_DRIVER_FLAGS2_ASSOCIATION_FRAME_ENCRYPTION)) {
-		wpa_printf(MSG_DEBUG,
-			   "EPPKE: Driver does not support association frame encryption");
-		return false;
-	}
-
-	ap_rsnxe = wpa_bss_get_rsnxe(wpa_s, bss, NULL, false);
-
-	if (!ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_KEK_IN_PASN)) {
-		wpa_printf(MSG_DEBUG, "EPPKE: AP does not support KEK_IN_PASN");
-		return false;
-	}
-
-	if (!ieee802_11_rsnx_capab(ap_rsnxe,
-				   WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION)) {
-		wpa_printf(MSG_DEBUG,
-			   "EPPKE: AP does not support association frame encryption");
-		return false;
-	}
-
-	if (unauth_eppke &&
-	    !ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_UNAUTH_EPPKE)) {
-		wpa_printf(MSG_DEBUG,
-			   "EPPKE: AP does not support unauthenticated EPPKE");
-		return false;
-	}
-
-	return true;
-}
-
-
 static int wpas_eppke_initialize(struct wpa_supplicant *wpa_s,
 				 struct wpa_bss *bss,
 				 struct wpa_ssid *ssid)
@@ -996,13 +1205,16 @@ static int wpas_eppke_initialize(struct wpa_supplicant *wpa_s,
 		return -1;
 	}
 
-	ap_rsne = wpa_bss_get_rsne(wpa_s, bss, NULL, false);
+	/* EPPKE has not been defined to be modified for RSN overriding, so use
+	 * the RSNE and RSNXE from the AP for PASN MIC calculation instead of
+	 * the RSNO elements, if any. */
+	ap_rsne = wpa_bss_get_ie(bss, WLAN_EID_RSN);
 	if (!ap_rsne) {
 		wpa_printf(MSG_DEBUG, "EPPKE: Can't connect without AP RSNE");
 		return -1;
 	}
 
-	ap_rsnxe = wpa_bss_get_rsnxe(wpa_s, bss, NULL, false);
+	ap_rsnxe = wpa_bss_get_ie(bss, WLAN_EID_RSNX);
 
 	ap_rsne_len = *(ap_rsne + 1) + 2;
 	ap_rsnxe_len = ap_rsnxe ? *(ap_rsnxe + 1) + 2 : 0;
@@ -1022,13 +1234,23 @@ static int wpas_eppke_initialize(struct wpa_supplicant *wpa_s,
 					ap_rsnxe, ap_rsnxe_len);
 	}
 
-	if (!ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_KEK_IN_PASN)) {
+	/* Use the RSNXOE, if it was included, for actual AP capability check */
+	ap_rsnxe = wpa_bss_get_rsnxe(wpa_s, bss, NULL, false);
+	/*
+	 * Security Profile element preference (IEEE P802.11bn/D2.0, 37.33):
+	 * check both the AP RSNXE and the (unmasked) Extended RSN Capabilities
+	 * embedded in the Security Profile element -- the AP might mask
+	 * capabilities from the RSNXE, but not from the Security Profile
+	 * element's copy.
+	 */
+	if (!wpas_eppke_ap_rsnx_capab(wpa_s, bss, WLAN_RSNX_CAPAB_KEK_IN_PASN))
+	{
 		wpa_printf(MSG_DEBUG, "EPPKE: AP does not support KEK_IN_PASN");
 		goto fail;
 	}
 
-	if (!ieee802_11_rsnx_capab(ap_rsnxe,
-				   WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION)) {
+	if (!wpas_eppke_ap_rsnx_capab(wpa_s, bss,
+				      WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION)) {
 		wpa_printf(MSG_DEBUG,
 			   "EPPKE: AP does not support association frame encryption");
 		goto fail;
@@ -1044,16 +1266,28 @@ static int wpas_eppke_initialize(struct wpa_supplicant *wpa_s,
 	capab |= BIT(WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION);
 	capab |= BIT(WLAN_RSNX_CAPAB_KEK_IN_PASN);
 #ifdef CONFIG_PMKSA_PRIVACY
-	if (ssid->pmksa_privacy)
+	if (ssid->pmksa_privacy ||
+	    (wpas_security_profile_active(wpa_s) &&
+	     sec_prof_list_has_epp(ssid->security_profiles)))
 		capab |= BIT(WLAN_RSNX_CAPAB_PMKSA_CACHING_PRIVACY);
 #endif /* CONFIG_PMKSA_PRIVACY */
 	pasn->derive_kek = true;
 
 	if (0) {
 #ifdef CONFIG_SAE
-	} else if (wpa_key_mgmt_sae_ext_key(ssid->key_mgmt)) {
+	} else if (wpa_key_mgmt_sae_ext_key(ssid->key_mgmt) ||
+		   (wpas_security_profile_active(wpa_s) &&
+		    sec_prof_list_has_sae(ssid->security_profiles))) {
 		capab |= BIT(WLAN_RSNX_CAPAB_SAE_H2E);
-		if (!ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_SAE_H2E)) {
+		/*
+		 * Security Profile element preference (IEEE P802.11bn/D2.0,
+		 * 37.33): check both the AP RSNXE and the (unmasked)
+		 * Extended RSN Capabilities embedded in the Security Profile
+		 * element -- the AP might mask capabilities from the RSNXE,
+		 * butnot from the Security Profile element's copy.
+		 */
+		if (!wpas_eppke_ap_rsnx_capab(wpa_s, bss,
+					     WLAN_RSNX_CAPAB_SAE_H2E)) {
 			wpa_printf(MSG_DEBUG,
 				   "EPPKE: AP does not support SAE H2E");
 			goto fail;
@@ -1079,8 +1313,11 @@ static int wpas_eppke_initialize(struct wpa_supplicant *wpa_s,
 					 WPA_PARAM_SAE_PW_ID_CHANGE, 1);
 		}
 #endif /* CONFIG_SAE */
-	} else if (wpa_key_mgmt_eppke(ssid->key_mgmt) &&
-		   wpa_key_mgmt_only_enhanced_open(ssid->key_mgmt)) {
+	} else if ((wpa_key_mgmt_eppke(ssid->key_mgmt) &&
+		    wpa_key_mgmt_only_enhanced_open(ssid->key_mgmt)) ||
+		   (wpa_s->sel_security_profile &&
+		    wpa_s->sel_security_profile->key_mgmt ==
+		    WPA_KEY_MGMT_EPPKE)) {
 		/* EPPKE without base AKM: verify AP supports unauthenticated
 		 * EPPKE per IEEE P802.11bi/D4.0, 12.16.9.1 */
 		if (!ieee802_11_rsnx_capab(ap_rsnxe,
@@ -1187,6 +1424,60 @@ static int wpas_eppke_initialize(struct wpa_supplicant *wpa_s,
 		   MAC2STR(pasn->peer_addr), pasn->akmp,
 		   pasn->cipher, pasn->group);
 
+	/*
+	 * Security Profile + EPPKE (SME-in-wpa_supplicant):
+	 * Include the Security Profile element in EPPKE Auth1 frame.
+	 * Per IEEE P802.11bn/D2.0, 37.33, the Security Profile element is only
+	 * sent when the RSNE is present in the Authentication frame. Auth1
+	 * contains RSNE; Auth3 does not. pasn_set_security_profile() wires it
+	 * into Auth1 only.
+	 *
+	 * The Security Profile element was populated in
+	 * wpa_supplicant_set_suites() based on the negotiated AKM and cipher.
+	 *
+	 * Conditions to include the Security Profile element:
+	 *   1. Security Profile support is active
+	 *   2. AP is advertising the Security Profile element
+	 *   3. A matching profile number was selected
+	 */
+#ifdef CONFIG_TESTING_OPTIONS
+	if (wpa_s->sec_prof_override_auth) {
+		wpa_printf(MSG_DEBUG,
+			   "TESTING: Security Profile element Auth override");
+		pasn_set_security_profile(
+			pasn,
+			wpabuf_head(wpa_s->sec_prof_override_auth),
+			wpabuf_len(wpa_s->sec_prof_override_auth));
+	} else
+#endif /* CONFIG_TESTING_OPTIONS */
+	if (wpas_security_profile_active(wpa_s) &&
+	    wpa_bss_get_ie_ext(bss, WLAN_EID_EXT_SECURITY_PROFILE) &&
+	    wpa_s->sel_security_profile &&
+	    wpa_s->security_profile_len > 0) {
+		if (pasn_set_security_profile(
+			    pasn,
+			    wpa_s->security_profile,
+			    wpa_s->security_profile_len) == 0)
+			wpa_printf(MSG_DEBUG,
+				   "EPPKE: Including Security Profile element in EPPKE Auth1 frame (profile=%d)",
+				   wpa_s->sel_security_profile->number);
+	} else if (wpas_security_profile_active(wpa_s)) {
+		u8 sp_elem[10];
+		int sp_len;
+
+		if (wpa_bss_get_ie_ext(bss, WLAN_EID_EXT_SECURITY_PROFILE)) {
+			wpa_printf(MSG_INFO,
+				   "Both STA and AP enables security profiles, but no matching security profile - do not try to connect with this AP");
+			goto fail;
+		}
+
+		sp_len = security_profile_build_empty(sp_elem, sizeof(sp_elem));
+		if (sp_len > 0 &&
+		    pasn_set_security_profile(pasn, sp_elem, sp_len) == 0)
+			wpa_printf(MSG_DEBUG,
+				   "EPPKE: Including empty Security Profile element in EPPKE Auth1 frame");
+	}
+
 	return 0;
 
 fail:
@@ -1221,6 +1512,10 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 #endif /* CONFIG_MBO */
 	int omit_rsnxe = 0;
 	unsigned int keys_to_clear = 0;
+	bool set_suites_done = false;
+#ifdef CONFIG_IEEE80211R
+	bool local_ft;
+#endif /* CONFIG_IEEE80211R */
 
 	if (bss == NULL) {
 		wpa_msg(wpa_s, MSG_ERROR, "SME: No scan result available for "
@@ -1238,16 +1533,44 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 
 #ifdef CONFIG_TESTING_OPTIONS
 		bss = wpas_ml_connect_pref(wpa_s, bss, ssid);
+#endif /* CONFIG_TESTING_OPTIONS */
 
 		if (wpa_s->conf->mld_force_single_link) {
 			wpa_printf(MSG_DEBUG, "MLD: Force single link");
 			wpa_s->valid_links = BIT(wpa_s->mlo_assoc_link_id);
 		}
-#endif /* CONFIG_TESTING_OPTIONS */
 		params.mld = true;
 		params.mld_link_id = wpa_s->mlo_assoc_link_id;
 		params.ap_mld_addr = wpa_s->ap_mld_addr;
 		wpas_ml_handle_removed_links(wpa_s, bss);
+	}
+
+	if (start && wpas_security_profile_active(wpa_s) &&
+	    ssid->security_profiles &&
+	    wpa_bss_get_ie_ext(bss, WLAN_EID_EXT_SECURITY_PROFILE)) {
+		bool try_opportunistic;
+		const u8 *cache_id = NULL;
+
+		try_opportunistic = ssid->proactive_key_caching < 0 ?
+			wpa_s->conf->okc : ssid->proactive_key_caching;
+		if (pmksa_cache_set_current(wpa_s->wpa, NULL,
+					    params.mld ? params.ap_mld_addr :
+					    bss->bssid,
+					    wpa_s->current_ssid,
+					    try_opportunistic, cache_id,
+					    0, false) == 0)
+			eapol_sm_notify_pmkid_attempt(wpa_s->eapol);
+		wpa_s->sme.assoc_req_ie_len = sizeof(wpa_s->sme.assoc_req_ie);
+		if (wpa_supplicant_set_suites(wpa_s, bss, ssid,
+					      wpa_s->sme.assoc_req_ie,
+					      &wpa_s->sme.assoc_req_ie_len,
+					      false)) {
+			wpa_msg(wpa_s, MSG_WARNING,
+				"SME: Failed to set key management and encryption suites");
+			wpas_connect_work_done(wpa_s);
+			return;
+		}
+		set_suites_done = true;
 	}
 
 	skip_auth = wpa_s->conf->reassoc_same_bss_optim &&
@@ -1290,7 +1613,22 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 	}
 #ifdef CONFIG_SAE
 	wpa_s->sme.sae_pmksa_caching = 0;
-	if (wpa_key_mgmt_sae(ssid->key_mgmt)) {
+	if (false) {
+#ifdef CONFIG_ENC_ASSOC
+	} else if (wpa_s->sel_security_profile &&
+		   (wpa_s->drv_flags2 & WPA_DRIVER_FLAGS2_EPPKE) &&
+		   (wpa_s->sel_security_profile->key_mgmt &
+		    WPA_KEY_MGMT_EPPKE)) {
+		wpa_dbg(wpa_s, MSG_DEBUG,
+			"Use EPPKE based on the selected security profile");
+		params.auth_alg = WPA_AUTH_ALG_EPPKE;
+#endif /* CONFIG_ENC_ASSOC */
+	} else if (wpa_s->sel_security_profile &&
+		   wpa_key_mgmt_sae(wpa_s->sel_security_profile->key_mgmt)) {
+		wpa_dbg(wpa_s, MSG_DEBUG,
+			"Using SAE auth_alg based on the selected security profile");
+		params.auth_alg = WPA_AUTH_ALG_SAE;
+	} else if (wpa_key_mgmt_sae(ssid->key_mgmt)) {
 		const u8 *rsn;
 		struct wpa_ie_data ied;
 
@@ -1309,7 +1647,24 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 #ifdef CONFIG_ENC_ASSOC
 		} else if ((wpa_s->drv_flags2 & WPA_DRIVER_FLAGS2_EPPKE) &&
 			   (ssid->key_mgmt & WPA_KEY_MGMT_EPPKE) &&
-			   (ied.key_mgmt & WPA_KEY_MGMT_EPPKE) &&
+			   /*
+			    * Security Profile element preference (IEEE
+			    * P802.11bn/D2.0, 37.33): Profile 1 and 2 APs
+			    * might advertise EPPKE only via the Security
+			    * Profile element bitmap -- their RSNE lists only
+			    * the pre-authentication AKM (SAE-EXT-KEY /
+			    * FT-SAE-EXT-KEY), not the EPPKE AKM suite itself.
+			    * Accept either the legacy RSNE EPPKE AKM or a
+			    * matching EPPKE sub-profile in the Security
+			    * Profile element.
+			    */
+			   ((ied.key_mgmt & WPA_KEY_MGMT_EPPKE) ||
+			    (wpas_security_profile_active(wpa_s) &&
+			     security_profile_has_eppke(
+				     wpa_bss_get_ie_ext(
+					     bss,
+					     WLAN_EID_EXT_SECURITY_PROFILE),
+				     ssid->key_mgmt))) &&
 			   wpa_key_mgmt_sae_ext_key(ssid->key_mgmt) &&
 			   wpa_key_mgmt_sae_ext_key(ied.key_mgmt) &&
 			   !wpas_is_sae_avoided(wpa_s, ssid, &ied) &&
@@ -1327,8 +1682,35 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 				params.auth_alg = WPA_AUTH_ALG_SAE;
 			}
 		} else {
-			wpa_dbg(wpa_s, MSG_DEBUG,
-				"SAE enabled, but target BSS does not advertise SAE AKM for RSN");
+			/*
+			 * Security Profile element preference
+			 * (IEEE P802.11bn/D2.0, 37.33): If the AP's Security
+			 * Profile element implies SAE-EXT-KEY (profiles 1, 2,
+			 * 9, 10), use SAE even when the RSNE only lists
+			 * WPA-PSK or another non-SAE AKM. The security profile
+			 * override in BSS selection already augmented
+			 * ie.key_mgmt, but authentication algorithm selection
+			 * is a separate decision here.
+			 */
+			if (wpas_security_profile_active(wpa_s)) {
+				const u8 *sp = wpa_bss_get_ie_ext(
+					bss, WLAN_EID_EXT_SECURITY_PROFILE);
+				int sp_km = security_profile_get_key_mgmt(
+					sp, ssid->key_mgmt);
+
+				if (sp_km && wpa_key_mgmt_sae(sp_km) &&
+				    !wpas_is_sae_avoided(wpa_s, ssid, &ied)) {
+					wpa_dbg(wpa_s, MSG_DEBUG,
+						"Using SAE auth_alg via Security Profile element override");
+					params.auth_alg = WPA_AUTH_ALG_SAE;
+				} else {
+					wpa_dbg(wpa_s, MSG_DEBUG,
+						"SAE enabled, but target BSS does not advertise SAE AKM for RSN");
+				}
+			} else {
+				wpa_dbg(wpa_s, MSG_DEBUG,
+					"SAE enabled, but target BSS does not advertise SAE AKM for RSN");
+			}
 		}
 	}
 #endif /* CONFIG_SAE */
@@ -1350,6 +1732,15 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 		} else if (ied.key_mgmt & WPA_KEY_MGMT_EPPKE &&
 			   wpas_eppke_ap_capable(wpa_s, bss, true)) {
 			wpa_dbg(wpa_s, MSG_DEBUG, "Using EPPKE auth_alg");
+			params.auth_alg = WPA_AUTH_ALG_EPPKE;
+		} else if (wpas_security_profile_active(wpa_s) &&
+			   (security_profile_get_key_mgmt(
+				   wpa_bss_get_ie_ext(
+					   bss,
+					   WLAN_EID_EXT_SECURITY_PROFILE),
+				   ssid->key_mgmt) & WPA_KEY_MGMT_EPPKE) &&
+			   wpas_eppke_ap_capable(wpa_s, bss, true)) {
+			wpa_dbg(wpa_s, MSG_DEBUG, "Using EPPKE auth_alg via security profile");
 			params.auth_alg = WPA_AUTH_ALG_EPPKE;
 		} else {
 			wpa_dbg(wpa_s, MSG_DEBUG,
@@ -1374,10 +1765,12 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 #endif /* CONFIG_WEP */
 
 #ifdef CONFIG_IEEE8021X_AUTH
-	if (ssid->eap_over_auth_frame &&
-	    wpa_key_mgmt_wpa_ieee8021x(ssid->key_mgmt &
-				       ~WPA_KEY_MGMT_IEEE8021X)) {
-		const u8 *rsne, *rsnxe;
+	if ((ssid->eap_over_auth_frame &&
+	     wpa_key_mgmt_wpa_ieee8021x(ssid->key_mgmt &
+					~WPA_KEY_MGMT_IEEE8021X)) ||
+	    (wpas_security_profile_active(wpa_s) &&
+	     sec_prof_list_has_eap_over_auth(ssid->security_profiles))) {
+		const u8 *rsne;
 		struct wpa_ie_data ied;
 
 		rsne = wpa_bss_get_rsne(wpa_s, bss, ssid, false);
@@ -1388,9 +1781,8 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 			   wpa_parse_wpa_ie(rsne, 2 + rsne[1], &ied) == 0 &&
 			   wpa_key_mgmt_wpa_ieee8021x(
 				   ied.key_mgmt & ~WPA_KEY_MGMT_IEEE8021X)) {
-			rsnxe = wpa_bss_get_ie(bss, WLAN_EID_RSNX);
-			if (ieee802_11_rsnx_capab(
-				    rsnxe,
+			if (wpas_eppke_ap_rsnx_capab(
+				    wpa_s, bss,
 				    WLAN_RSNX_CAPAB_802_1X_IN_AUTH_FRAMES) &&
 			    (wpa_s->drv_flags2 &
 			     WPA_DRIVER_FLAGS2_802_1X_AUTH)) {
@@ -1410,9 +1802,10 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 
 	if (!start)
 		goto skip_setup;
-	if ((wpa_bss_get_vendor_ie(bss, WPA_IE_VENDOR_TYPE) ||
-	     wpa_bss_get_rsne(wpa_s, bss, ssid, false)) &&
-	    wpa_key_mgmt_wpa(ssid->key_mgmt)) {
+	if (set_suites_done) {
+	} else if ((wpa_bss_get_vendor_ie(bss, WPA_IE_VENDOR_TYPE) ||
+		    wpa_bss_get_rsne(wpa_s, bss, ssid, false)) &&
+		   wpa_key_mgmt_wpa(ssid->key_mgmt)) {
 		int try_opportunistic;
 		const u8 *cache_id = NULL;
 
@@ -1476,7 +1869,6 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 		wpa_supplicant_set_non_wpa_policy(wpa_s, ssid);
 		wpa_s->sme.assoc_req_ie_len = 0;
 	}
-skip_setup:
 
 	/* In case the WPA vendor IE is used, it should be placed after all the
 	 * non-vendor IEs, as the lower layer expects the IEs to be ordered as
@@ -1501,6 +1893,7 @@ skip_setup:
 		}
 	} else if (wpa_s->wpa_proto == WPA_PROTO_RSN &&
 		   wpa_key_mgmt_wpa_psk_no_sae(wpa_s->key_mgmt) &&
+		   !wpa_s->sel_security_profile &&
 		   !wpa_bss_get_rsnxe(wpa_s, bss, ssid, false)) {
 		/* Omit RSNXE for WPA2-Personal connections to avoid AP
 		 * compatibility issues. */
@@ -1512,8 +1905,10 @@ skip_setup:
 	if (ie && ie[1] >= MOBILITY_DOMAIN_ID_LEN)
 		md = ie + 2;
 	wpa_sm_set_ft_params(wpa_s->wpa, ie, ie ? 2 + ie[1] : 0);
-	if (md && (!wpa_key_mgmt_ft(ssid->key_mgmt) ||
-		   !wpa_key_mgmt_ft(wpa_s->key_mgmt)))
+	local_ft = wpa_key_mgmt_ft(ssid->key_mgmt) ||
+		(wpa_s->sel_security_profile &&
+		 wpa_key_mgmt_ft(wpa_s->sel_security_profile->key_mgmt));
+	if (md && (!local_ft || !wpa_key_mgmt_ft(wpa_s->key_mgmt)))
 		md = NULL;
 	if (md) {
 		/* Prepare for the next transition */
@@ -1711,6 +2106,7 @@ skip_setup:
 	}
 #endif /* CONFIG_MBO */
 
+skip_setup:
 #ifdef CONFIG_ENC_ASSOC
 	if (!skip_auth && params.auth_alg == WPA_AUTH_ALG_EPPKE) {
 		if (start) {
@@ -2397,7 +2793,7 @@ static int sme_handle_eppke_external_auth_start(struct wpa_supplicant *wpa_s,
 				    ext_auth->group_mgmt_cipher,
 				    ext_auth->rsn_capab,
 				    ext_auth->rsnxe_data,
-				    is_ml_peer);
+				    is_ml_peer, false);
 }
 
 #endif /* CONFIG_ENC_ASSOC */
@@ -3042,7 +3438,7 @@ static int sme_sae_set_pmk(struct wpa_supplicant *wpa_s, const u8 *bssid)
 	wpa_printf(MSG_DEBUG,
 		   "SME: SAE completed - setting PMK for 4-way handshake");
 	wpa_sm_set_pmk(wpa_s->wpa, wpa_s->sme.sae.pmk, wpa_s->sme.sae.pmk_len,
-		       wpa_s->sme.sae.pmkid, bssid);
+		       wpa_s->sme.sae.pmkid, bssid, PASN_GROUP_NOT_SPECIFIED);
 	if (wpa_s->conf->sae_pmkid_in_assoc) {
 		/* Update the own RSNE contents now that we have set the PMK
 		 * and added a PMKSA cache entry based on the successfully
@@ -3679,7 +4075,9 @@ static void sme_process_802_1x_auth_response(struct wpa_supplicant *wpa_s,
 		if (eapol_sm_get_success(wpa_s->eapol) &&
 		    auth->status_code != WLAN_STATUS_802_1_X_AUTH_SUCCESS) {
 			wpa_msg(wpa_s, MSG_INFO,
-				"IEEE 802.1X: Invalid status code in EAP-Success authentication frame");
+				"IEEE 802.1X: Invalid status code %u in EAP-Success authentication frame (expected %u)",
+				auth->status_code,
+				WLAN_STATUS_802_1_X_AUTH_SUCCESS);
 			goto fail;
 		}
 	}
@@ -3688,7 +4086,7 @@ static void sme_process_802_1x_auth_response(struct wpa_supplicant *wpa_s,
 	    wpa_s->auth_1x->pmkid_found) {
 		if (wpa_s->auth_1x->derive_ptk) {
 			struct wpa_ptk ptk;
-			const u8 *pmk;
+			u8 pmk[PMK_LEN_MAX];
 			size_t pmk_len;
 			size_t kdk_len;
 			static const u8 zero[6] = { 0 };
@@ -3697,11 +4095,11 @@ static void sme_process_802_1x_auth_response(struct wpa_supplicant *wpa_s,
 
 			pairwise_cipher = sme_get_pairwise_cipher(wpa_s,
 								  external);
-			pmk = wpa_sm_get_pmk(wpa_s->wpa, peer_addr,
-					     wpa_s->auth_1x->pmkid_found ?
-					     wpa_s->auth_1x->pmkid :
-					     NULL, &pmk_len);
-			if (!pmk) {
+			if (sme_get_pmk_for_1x_auth(
+				    wpa_s,
+				    wpa_s->auth_1x->pmkid_found ?
+				    wpa_s->auth_1x->pmkid : NULL,
+				    external, pmk, &pmk_len) < 0) {
 				wpa_msg(wpa_s, MSG_INFO,
 					"IEEE 802.1X: Failed to get PMK");
 				goto fail;
@@ -3720,8 +4118,11 @@ static void sme_process_802_1x_auth_response(struct wpa_supplicant *wpa_s,
 				    &ptk, kdk_len) < 0) {
 				wpa_msg(wpa_s, MSG_INFO,
 					"SME: PTK derivation failed");
+				forced_memzero(pmk, PMK_LEN_MAX);
 				goto fail;
 			}
+
+			forced_memzero(pmk, PMK_LEN_MAX);
 
 			/* Clear DHss after successful PTK derivation */
 			wpabuf_clear_free(wpa_s->auth_1x->dhss);
@@ -3925,7 +4326,7 @@ void sme_event_auth(struct wpa_supplicant *wpa_s, union wpa_event_data *data)
 		if (pasn->pmksa_entry)
 			wpa_sm_set_cur_pmksa(wpa_s->wpa, pasn->pmksa_entry);
 		wpa_sm_set_pmk(wpa_s->wpa, pasn->pmk, pasn->pmk_len,
-			       pasn->sae.pmkid, NULL);
+			       pasn->sae.pmkid, NULL, pasn_params.group);
 
 		sme_send_authentication(wpa_s, wpa_s->current_bss,
 					wpa_s->current_ssid, 0);
@@ -4461,7 +4862,9 @@ mscs_fail:
 #ifdef CONFIG_PMKSA_PRIVACY
 	ap_rsnxe = wpa_bss_get_rsnxe(wpa_s, wpa_s->current_bss,
 				     NULL, wpa_s->valid_links);
-	if (ssid->pmksa_privacy &&
+	if ((ssid->pmksa_privacy ||
+	     (wpas_security_profile_active(wpa_s) &&
+	      ssid->security_profiles)) &&
 	    (wpa_s->drv_flags2 &
 	     WPA_DRIVER_FLAGS2_ASSOCIATION_FRAME_ENCRYPTION) &&
 	    ieee802_11_rsnx_capab(ap_rsnxe,
@@ -4504,6 +4907,62 @@ mscs_fail:
 		sme_add_802_1x_mic_in_assoc(wpa_s, wpa_s->valid_links ?
 					    wpa_s->ap_mld_addr : bssid);
 #endif /* CONFIG_IEEE8021X_AUTH */
+
+	/*
+	 * Security Profile element - association frame inclusion (IEEE
+	 * P802.11bn/D2.0, 37.33):
+	 * Include unconditionally when a profile has been selected (unlike the
+	 * Authentication frame, inclusion here does not depend on RSNE
+	 * presence). The element was pre-built in wpa_supplicant_set_suites()
+	 * from the same wpa_sm state as the RSNE and RSNXE, guaranteeing
+	 * consistency.
+	 */
+#ifdef CONFIG_TESTING_OPTIONS
+	if (wpa_s->sec_prof_override_assoc &&
+	    wpabuf_len(wpa_s->sec_prof_override_assoc) <=
+	    sizeof(wpa_s->sme.assoc_req_ie) - wpa_s->sme.assoc_req_ie_len) {
+		wpa_printf(MSG_DEBUG, "TESTING: Security Profile element AssocReq override");
+		os_memcpy(wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len,
+			  wpabuf_head(wpa_s->sec_prof_override_assoc),
+			  wpabuf_len(wpa_s->sec_prof_override_assoc));
+		wpa_s->sme.assoc_req_ie_len +=
+			wpabuf_len(wpa_s->sec_prof_override_assoc);
+	} else
+#endif /* CONFIG_TESTING_OPTIONS */
+	if (wpa_s->sel_security_profile &&
+	    wpa_s->security_profile_len > 0 &&
+	    wpa_s->security_profile_len <=
+	    sizeof(wpa_s->sme.assoc_req_ie) - wpa_s->sme.assoc_req_ie_len) {
+		os_memcpy(wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len,
+			  wpa_s->security_profile,
+			  wpa_s->security_profile_len);
+		wpa_s->sme.assoc_req_ie_len += wpa_s->security_profile_len;
+		wpa_printf(MSG_DEBUG,
+			   "SME: Appended Security Profile element to Association Request frame elements (profile=%d)",
+			   wpa_s->sel_security_profile->number);
+	} else if (wpas_security_profile_active(wpa_s)) {
+		u8 sp_elem[10];
+		int sp_len;
+
+		if (wpa_bss_get_ie_ext(wpa_s->current_bss,
+				       WLAN_EID_EXT_SECURITY_PROFILE)) {
+			wpa_printf(MSG_INFO,
+				   "Both STA and AP enables security profiles, but no matching security profile - do not try to connect with this AP");
+			return;
+		}
+
+		sp_len = security_profile_build_empty(sp_elem, sizeof(sp_elem));
+		if (sp_len > 0 &&
+		    (size_t) sp_len <= sizeof(wpa_s->sme.assoc_req_ie) -
+		    wpa_s->sme.assoc_req_ie_len) {
+			os_memcpy(wpa_s->sme.assoc_req_ie +
+				  wpa_s->sme.assoc_req_ie_len,
+				  sp_elem, sp_len);
+			wpa_s->sme.assoc_req_ie_len += sp_len;
+			wpa_printf(MSG_DEBUG,
+				   "SME: Appended empty Security Profile element to Association Request frame elements");
+		}
+	}
 
 	params.bssid = bssid;
 	params.ssid = wpa_s->sme.ssid;
@@ -4950,8 +5409,9 @@ void sme_event_assoc_reject(struct wpa_supplicant *wpa_s,
 		else
 			aa = NULL;
 
-		wpa_sm_pmksa_cache_flush_addr(wpa_s->wpa, wpa_s->current_ssid,
-					      aa);
+		if (aa)
+			wpa_sm_pmksa_cache_flush_addr(wpa_s->wpa,
+						      wpa_s->current_ssid, aa);
 		if (wpa_s->current_bss) {
 			struct wpa_ssid *ssid = wpa_s->current_ssid;
 
@@ -5019,6 +5479,40 @@ void sme_event_assoc_timed_out(struct wpa_supplicant *wpa_s,
 	wpa_dbg(wpa_s, MSG_DEBUG, "SME: Association timed out");
 	wpas_connection_failed(wpa_s, wpa_s->pending_bssid, NULL);
 	wpa_supplicant_mark_disassoc(wpa_s);
+}
+
+
+void sme_event_deauth(struct wpa_supplicant *wpa_s, struct deauth_info *info)
+{
+#ifdef CONFIG_SAE
+	const u8 *aa;
+
+	/* Some APs reject a (Re)Association Request frame that tries to use
+	 * PMKSA caching by deauthenticating the STA with reason code 9
+	 * (STA_REQ_ASSOC_WITHOUT_AUTH) instead of responding to it with an
+	 * error status code. Drop the PMKSA cache entry for that AP in that
+	 * case so that the next attempt uses a full SAE authentication
+	 * instead of finding the same PMKSA cache entry again and repeating
+	 * the same failure. */
+	if (!wpa_s->sme.sae_pmksa_caching || !info || info->locally_generated ||
+	    info->reason_code != WLAN_REASON_STA_REQ_ASSOC_WITHOUT_AUTH ||
+	    wpa_s->wpa_state != WPA_ASSOCIATING || !wpa_s->current_ssid ||
+	    !wpa_key_mgmt_sae(wpa_s->current_ssid->key_mgmt))
+		return;
+
+	if (wpa_s->valid_links)
+		aa = wpa_s->ap_mld_addr;
+	else if (wpa_s->current_bss)
+		aa = wpa_s->current_bss->bssid;
+	else
+		return; /* Do not flush the PMKSA cache entries of the full ESS
+			 * based on an unprotected frame from a single AP. */
+
+	wpa_dbg(wpa_s, MSG_DEBUG,
+		"SME: PMKSA caching attempt rejected with deauthentication - drop PMKSA cache entry");
+	wpa_sm_aborted_cached(wpa_s->wpa);
+	wpa_sm_pmksa_cache_flush_addr(wpa_s->wpa, wpa_s->current_ssid, aa);
+#endif /* CONFIG_SAE */
 }
 
 

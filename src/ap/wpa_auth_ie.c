@@ -319,7 +319,14 @@ static u8 * rsne_write_data(u8 *buf, size_t len, u8 *pos, int group,
 	}
 #endif /* CONFIG_RSN_TESTING */
 
-	if (num_suites == 0) {
+	/*
+	 * WPA_KEY_MGMT_802_1X_PQC and WPA_KEY_MGMT_FT_802_1X_PQC are not
+	 * required to be included in the RSNE in Beacon/Probe Response frames
+	 * since they can be used only with security profiles.
+	 */
+	if (num_suites == 0 &&
+	    !(key_mgmt & (WPA_KEY_MGMT_PQC_8021X |
+			  WPA_KEY_MGMT_FT_PQC_8021X))) {
 		wpa_printf(MSG_DEBUG, "Invalid key management type (%d).",
 			   key_mgmt);
 		return NULL;
@@ -582,10 +589,10 @@ static u64 rsnxe_capab(struct wpa_auth_config *conf, int key_mgmt)
 	 * Frame Encryption Support field in the RSNXE to 1.
 	 */
 	if (conf->assoc_frame_encryption ||
-	    conf->pmksa_caching_privacy) {
+	    conf->pmksa_caching_privacy)
 		capab |= BIT(WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION);
+	if (key_mgmt & WPA_KEY_MGMT_EPPKE)
 		capab |= BIT(WLAN_RSNX_CAPAB_KEK_IN_PASN);
-	}
 	if (conf->pmksa_caching_privacy)
 		capab |= BIT(WLAN_RSNX_CAPAB_PMKSA_CACHING_PRIVACY);
 	if (conf->eap_using_authentication_frames)
@@ -605,6 +612,7 @@ int wpa_write_rsnxe(struct wpa_auth_config *conf, u8 *buf, size_t len)
 	size_t flen;
 
 	capab = rsnxe_capab(conf, conf->wpa_key_mgmt);
+	capab &= conf->rsnxe_capab_mask;
 
 	if (!capab)
 		return 0; /* no supported extended RSN capabilities */
@@ -915,7 +923,8 @@ wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
 		    const u8 *rsnxe, size_t rsnxe_len,
 		    const u8 *mdie, size_t mdie_len,
 		    const u8 *owe_dh, size_t owe_dh_len,
-		    struct wpa_state_machine *assoc_sm, bool is_ml)
+		    struct wpa_state_machine *assoc_sm, bool is_ml,
+		    const struct security_profile_entry *security_profile)
 {
 	struct wpa_auth_config *conf = &wpa_auth->conf;
 	struct wpa_ie_data data;
@@ -1078,8 +1087,23 @@ wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
 			wpa_auth->conf.rsn_override_key_mgmt_2;
 	else if (sm->rsn_override)
 		key_mgmt = data.key_mgmt & wpa_auth->conf.rsn_override_key_mgmt;
+	else if (security_profile)
+		key_mgmt = data.key_mgmt & security_profile->key_mgmt;
 	else
 		key_mgmt = data.key_mgmt & wpa_auth->conf.wpa_key_mgmt;
+
+	/* For an MLO partner link, the STA may not include an RSN Selection
+	 * element (no RSNO support), so sm->rsn_override* are both false and
+	 * key_mgmt is matched against wpa_key_mgmt (e.g., WPA-PSK on 2.4 GHz).
+	 * But the STA negotiated via the primary link (e.g., SAE on 6 GHz)
+	 * and sends SAE in the per-STA profile RSNE assuming that the same
+	 * AKM is enabled on all affiliated links. When rsn_override_mlo_compat
+	 * is enabled, fall back to rsn_override_key_mgmt so that SAE is
+	 * accepted on the partner link in such cases.
+	 */
+	if (!key_mgmt && assoc_sm && wpa_auth->conf.rsn_override_mlo_compat)
+		key_mgmt = data.key_mgmt & wpa_auth->conf.rsn_override_key_mgmt;
+
 	if (!key_mgmt) {
 		wpa_printf(MSG_DEBUG, "Invalid WPA key mgmt (0x%x) from "
 			   MACSTR, data.key_mgmt, MAC2STR(sm->addr));
@@ -1145,6 +1169,12 @@ wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
 	else if (key_mgmt & WPA_KEY_MGMT_EPPKE)
 		sm->wpa_key_mgmt = WPA_KEY_MGMT_EPPKE;
 #endif /* CONFIG_ENC_ASSOC */
+#ifdef CONFIG_PQC
+	else if (key_mgmt & WPA_KEY_MGMT_FT_PQC_8021X)
+		sm->wpa_key_mgmt = WPA_KEY_MGMT_FT_PQC_8021X;
+	else if (key_mgmt & WPA_KEY_MGMT_PQC_8021X)
+		sm->wpa_key_mgmt = WPA_KEY_MGMT_PQC_8021X;
+#endif /* CONFIG_PQC */
 	else
 		sm->wpa_key_mgmt = WPA_KEY_MGMT_PSK;
 
@@ -1154,6 +1184,9 @@ wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
 	else if (version == WPA_PROTO_RSN && sm->rsn_override)
 		ciphers = data.pairwise_cipher &
 			wpa_auth->conf.rsn_override_pairwise;
+	else if (version == WPA_PROTO_RSN && security_profile)
+		ciphers = data.pairwise_cipher &
+			security_profile->pairwise_cipher;
 	else if (version == WPA_PROTO_RSN)
 		ciphers = data.pairwise_cipher & wpa_auth->conf.rsn_pairwise;
 	else
@@ -1179,6 +1212,14 @@ wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
 				   "cipher %d", data.mgmt_group_cipher);
 			return WPA_INVALID_MGMT_GROUP_CIPHER;
 		}
+	}
+
+	/* All security profiles require MFP to be negotiated. Enforce this
+	 * regardless of the ieee80211w configuration parameter. */
+	if (security_profile && !(data.capabilities & WPA_CAPABILITY_MFPC)) {
+		wpa_printf(MSG_DEBUG,
+			   "STA used a security profile but did not enable MFP in RSNE");
+		return WPA_MGMT_FRAME_PROTECTION_VIOLATION;
 	}
 
 #ifdef CONFIG_SAE

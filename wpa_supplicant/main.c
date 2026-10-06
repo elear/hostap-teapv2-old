@@ -45,6 +45,9 @@ static void usage(void)
 #ifdef CONFIG_PROCESS_COORDINATION
 	       "        [-z<process coordination directory>] \\\n"
 #endif /* CONFIG_PROCESS_COORDINATION */
+#ifdef CONFIG_BACKEND_FILE
+	       "        [-x<required configuration file prefix>] \\\n"
+#endif /* CONFIG_BACKEND_FILE */
 	       "        [-o<override driver>] [-O<override ctrl>] \\\n"
 	       "        [-N -i<ifname> -c<conf> [-C<ctrl>] "
 	       "[-D<driver>] \\\n"
@@ -116,7 +119,7 @@ static void usage(void)
 	printf("example:\n"
 	       "  wpa_supplicant -D%s -iwlan0 -c/etc/wpa_supplicant.conf\n",
 	       wpa_drivers[0] ? wpa_drivers[0]->name : "nl80211");
-	printf("\nIf run without specifying a network interface or control interface, the a\n"
+	printf("\nIf run without specifying a network interface or control interface, a\n"
 	       "configuration file is parsed without starting any operation.\n"
 		"This can be used to check whether a configuration file has valid contents.\n");
 #endif /* CONFIG_NO_STDOUT_DEBUG */
@@ -213,7 +216,7 @@ int main(int argc, char *argv[])
 
 	for (;;) {
 		c = getopt(argc, argv,
-			   "b:Bc:C:D:de:f:g:G:hi:I:KLMm:No:O:p:P:qsTtuvWyz:");
+			   "b:Bc:C:D:de:f:g:G:hi:I:KLMm:No:O:p:P:qsTtuvWx:yz:");
 		if (c < 0)
 			break;
 		switch (c) {
@@ -344,6 +347,11 @@ int main(int argc, char *argv[])
 			iface = &ifaces[iface_count - 1];
 			os_memset(iface, 0, sizeof(*iface));
 			break;
+#ifdef CONFIG_BACKEND_FILE
+		case 'x':
+			params.conf_file_prefix = optarg;
+			break;
+#endif /* CONFIG_BACKEND_FILE */
 		case 'y':
 			params.show_details = true;
 			break;

@@ -541,50 +541,6 @@ fail:
 }
 
 
-static int hkdf_extract(size_t hash_len, const u8 *salt, size_t salt_len,
-			size_t num_elem, const u8 *addr[], const size_t len[],
-			u8 *prk)
-{
-	if (hash_len == 32)
-		return hmac_sha256_vector(salt, salt_len, num_elem, addr, len,
-					  prk);
-#ifdef CONFIG_SHA384
-	if (hash_len == 48)
-		return hmac_sha384_vector(salt, salt_len, num_elem, addr, len,
-					  prk);
-#endif /* CONFIG_SHA384 */
-#ifdef CONFIG_SHA512
-	if (hash_len == 64)
-		return hmac_sha512_vector(salt, salt_len, num_elem, addr, len,
-					  prk);
-#endif /* CONFIG_SHA512 */
-	return -1;
-}
-
-
-static int hkdf_expand(size_t hash_len, const u8 *prk, size_t prk_len,
-		       const char *info, u8 *okm, size_t okm_len)
-{
-	size_t info_len = os_strlen(info);
-
-	if (hash_len == 32)
-		return hmac_sha256_kdf(prk, prk_len, NULL,
-				       (const u8 *) info, info_len,
-				       okm, okm_len);
-#ifdef CONFIG_SHA384
-	if (hash_len == 48)
-		return hmac_sha384_kdf(prk, prk_len, NULL,
-				       (const u8 *) info, info_len,
-				       okm, okm_len);
-#endif /* CONFIG_SHA384 */
-#ifdef CONFIG_SHA512
-	if (hash_len == 64)
-		return hmac_sha512_kdf(prk, prk_len, NULL,
-				       (const u8 *) info, info_len,
-				       okm, okm_len);
-#endif /* CONFIG_SHA512 */
-	return -1;
-}
 
 
 static int sswu_curve_param(int group, int *z)
@@ -1658,7 +1614,7 @@ static int sae_derive_keys(struct sae_data *sae, const u8 *k)
 	os_memcpy(sae->pmkid, val, SAE_PMKID_LEN);
 #ifdef CONFIG_SAE_PK
 	if (sae->pk) {
-		os_memcpy(sae->tmp->kek, keys + hash_len + SAE_PMK_LEN,
+		os_memcpy(sae->tmp->kek, keys + hash_len + pmk_len,
 			  hash_len);
 		sae->tmp->kek_len = hash_len;
 		wpa_hexdump_key(MSG_DEBUG, "SAE: KEK for SAE-PK",
@@ -1905,10 +1861,12 @@ static void sae_parse_token_container(struct sae_data *sae,
 {
 	if (!sae_is_token_container_elem(pos, end))
 		return;
-	*token = pos + 3;
-	*token_len = pos[1] - 1;
+	if (token)
+		*token = pos + 3;
+	if (token_len)
+		*token_len = pos[1] - 1;
 	wpa_hexdump(MSG_DEBUG, "SAE: Anti-Clogging Token (in container)",
-		    *token, *token_len);
+		    pos + 3, pos[1] - 1);
 }
 
 
@@ -2399,8 +2357,12 @@ int sae_write_confirm(struct sae_data *sae, struct wpabuf *buf)
 	size_t hash_len;
 	int res;
 
-	if (sae->tmp == NULL)
+	if (!sae->tmp || !sae->tmp->own_commit_scalar ||
+	    !sae->peer_commit_scalar) {
+		wpa_printf(MSG_INFO, "%s: No own/peer scalar available",
+			   __func__);
 		return -1;
+	}
 
 	hash_len = sae->tmp->kck_len;
 

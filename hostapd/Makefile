@@ -361,6 +361,14 @@ CFLAGS += -DCONFIG_IEEE80211AX
 OBJS += ../src/ap/ieee802_11_he.o
 endif
 
+ifdef CONFIG_IEEE80211AX
+ifdef CONFIG_AFC
+CFLAGS += -DCONFIG_AFC
+OBJS += ../src/ap/afc.o
+NEED_JSON=y
+endif
+endif
+
 ifdef CONFIG_MBO
 CFLAGS += -DCONFIG_MBO
 OBJS += ../src/ap/mbo_ap.o
@@ -630,7 +638,20 @@ endif
 ifdef CONFIG_NAN_USD
 OBJS += ../src/common/nan_de.o
 OBJS += ../src/ap/nan_usd_ap.o
+OBJS += ../src/nan/nan_crypto.o
 CFLAGS += -DCONFIG_NAN_USD
+endif
+
+ifdef CONFIG_PQC
+CONFIG_IEEE8021X_AUTH=y
+CONFIG_PMKSA_PRIVACY=y
+CONFIG_ENC_ASSOC=y
+CFLAGS += -DCONFIG_PQC
+NEED_HMAC_SHA384_KDF=y
+NEED_HMAC_SHA512_KDF=y
+NEED_SHA384=y
+NEED_SHA512=y
+NEED_OPENSSL_3_5=y
 endif
 
 ifdef CONFIG_PMKSA_PRIVACY
@@ -765,6 +786,16 @@ endif
 ifeq ($(CONFIG_TLS), openssl)
 CFLAGS += -DCRYPTO_RSA_OAEP_SHA256
 CONFIG_CRYPTO=openssl
+ifdef NEED_OPENSSL_3_5
+ifneq ($(OPENSSL_PREFIX),)
+CFLAGS += -I$(OPENSSL_PREFIX)/include
+LDFLAGS += -L$(OPENSSL_PREFIX)/lib -Wl,-rpath,$(OPENSSL_PREFIX)/lib
+else
+ifeq ($(shell pkg-config --atleast-version=3.5 openssl 2>/dev/null && echo yes),)
+$(error CONFIG_PQC requires OpenSSL >= 3.5; set OPENSSL_PREFIX or install OpenSSL 3.5)
+endif
+endif
+endif
 ifdef TLS_FUNCS
 OBJS += ../src/crypto/tls_openssl.o
 OBJS += ../src/crypto/tls_openssl_ocsp.o
@@ -1135,12 +1166,15 @@ ifdef NEED_TLS_PRF_SHA384
 OBJS += ../src/crypto/sha384-tlsprf.o
 endif
 ifdef NEED_HMAC_SHA256_KDF
+CFLAGS += -DCONFIG_HMAC_SHA256_KDF
 OBJS += ../src/crypto/sha256-kdf.o
 endif
 ifdef NEED_HMAC_SHA384_KDF
+CFLAGS += -DCONFIG_HMAC_SHA384_KDF
 OBJS += ../src/crypto/sha384-kdf.o
 endif
 ifdef NEED_HMAC_SHA512_KDF
+CFLAGS += -DCONFIG_HMAC_SHA512_KDF
 OBJS += ../src/crypto/sha512-kdf.o
 endif
 ifdef NEED_SHA384
@@ -1289,6 +1323,11 @@ OBJS += ../src/ap/ndisc_snoop.o
 endif
 endif
 
+ifdef CONFIG_ROBUST_AV
+CFLAGS += -DCONFIG_ROBUST_AV
+OBJS += ../src/ap/robust_av.o
+endif
+
 OBJS += ../src/drivers/driver_common.o
 
 ifdef CONFIG_WPA_CLI_EDIT
@@ -1420,8 +1459,16 @@ SOBJS += ../src/common/sae.o
 SOBJS += ../src/common/sae_pk.o
 SOBJS += ../src/common/dragonfly.o
 SOBJS += $(AESOBJS)
+ifneq ($(CONFIG_TLS), openssl)
+ifneq ($(CONFIG_TLS), linux)
+ifneq ($(CONFIG_TLS), gnutls)
+ifneq ($(CONFIG_TLS), wolfssl)
 SOBJS += ../src/crypto/sha384.o
 SOBJS += ../src/crypto/sha512.o
+endif
+endif
+endif
+endif
 SOBJS += ../src/crypto/sha256-prf.o
 SOBJS += ../src/crypto/sha384-prf.o
 SOBJS += ../src/crypto/sha512-prf.o
@@ -1430,7 +1477,11 @@ SOBJS += ../src/crypto/sha256-kdf.o
 SOBJS += ../src/crypto/sha384-kdf.o
 SOBJS += ../src/crypto/sha512-kdf.o
 SOBJS += ../src/common/wpa_common.o
+ifdef CONFIG_NO_RANDOM_POOL
+CFLAGS += -DCONFIG_NO_RANDOM_POOL
+else
 SOBJS += ../src/crypto/random.o
+endif
 SOBJS += ../src/crypto/sha1-prf.o
 SOBJS += ../src/utils/eloop.o
 

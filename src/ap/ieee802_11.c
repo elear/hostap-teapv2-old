@@ -62,6 +62,7 @@
 #include "comeback_token.h"
 #include "nan_usd_ap.h"
 #include "pasn/pasn_common.h"
+#include "robust_av.h"
 
 
 #ifdef CONFIG_FILS
@@ -151,7 +152,8 @@ static size_t hostapd_supp_rates(struct hostapd_data *hapd, u8 *buf)
 #endif /* CONFIG_IEEE80211AX */
 
 #ifdef CONFIG_IEEE80211BE
-	if (hapd->iconf->ieee80211be && hapd->iconf->require_eht)
+	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be &&
+	    (hapd->iconf->require_eht || hapd->conf->bss_require_eht))
 		*pos++ = 0x80 | BSS_MEMBERSHIP_SELECTOR_EHT_PHY;
 #endif /* CONFIG_IEEE80211BE */
 
@@ -169,6 +171,348 @@ static size_t hostapd_supp_rates(struct hostapd_data *hapd, u8 *buf)
 #endif /* CONFIG_SAE */
 
 	return pos - buf;
+}
+
+
+static int get_sta_profile_num(const u8 *sec_prof, size_t len)
+{
+	u8 indication, bitmap_len, num_vendor;
+	const u8 *bitmap;
+	unsigned int i;
+	int num = -1;
+
+	if (!sec_prof || len < 2)
+		return -1;
+
+	/* Parse Security Profile Indication field (1 octet):
+	 * Bits 0-3: bitmap_len (number of octets in the bitmap)
+	 * Bits 4-7: vendor profile count
+	 */
+	indication = sec_prof[1];
+	bitmap_len = indication & 0x0f;
+	num_vendor = (indication & 0xf0) >> 4;
+
+	if (num_vendor > 0) {
+		wpa_printf(MSG_DEBUG,
+			   "STA Security Profile element indicated a not supported vendor profile");
+		return -1;
+	}
+
+	if (len < (size_t) (2 + bitmap_len)) {
+		wpa_printf(MSG_DEBUG,
+			   "Truncated Security Profile element bitmap");
+		return -1;
+	}
+
+	if (bitmap_len == 0) {
+		wpa_printf(MSG_DEBUG, "Empty Security Profile element bitmap");
+		return -1;
+	}
+
+	bitmap = &sec_prof[2];
+
+	/* The Security Profile element from a STA is allowed to have only a
+	 * single profile being indicated. Check that and determine the
+	 * indicated security profile number. Vendor specific security profiles
+	 * are not yet supported. */
+	for (i = 0; i < bitmap_len * 8; i++) {
+		if (bitmap[i / 8] & BIT(i % 8)) {
+			if (num >= 0) {
+				wpa_printf(MSG_DEBUG,
+					   "STA Security Profile element indicated more than a single profile");
+				return -1;
+			}
+
+			num = i;
+		}
+	}
+
+	if (num >= 0)
+		wpa_printf(MSG_DEBUG, "STA security profile number: %u", num);
+	else
+		wpa_printf(MSG_DEBUG,
+			   "No security profile set in STA Security Profile element bitmap");
+	return num;
+}
+
+
+static bool hostapd_sec_prof_enabled(const struct hostapd_bss_config *conf,
+				     int num)
+{
+	unsigned int i;
+
+	for (i = 0; conf->security_profiles[i] >= 0; i++) {
+		if (conf->security_profiles[i] == num)
+			return true;
+	}
+
+	return false;
+}
+
+
+/**
+ * find_and_validate_profile - Find and validate a matching security profile
+ * @hapd: AP data
+ * @sta: Station
+ * @assoc: Whether this is for (Re)Association Request frame
+ * @sta_profile_num: Security profile number from STA's Security Profile element
+ * @rsne_data: Parsed RSNE data from STA
+ * @rsnxe: STA's RSNXE data
+ * @rsnxe_len: STA's RSNXE data len
+ * @profile_matched: On success, returns the matched profile entry
+ * Returns: true if a matching security profile is found and validated, false
+ * otherwise
+ */
+static bool find_and_validate_profile(
+	struct hostapd_data *hapd, struct sta_info *sta, bool assoc,
+	int sta_profile_num,
+	const struct wpa_ie_data *rsne_data,
+	const u8 *rsnxe, size_t rsnxe_len,
+	const struct security_profile_entry **profile_matched)
+{
+	const struct security_profile_entry *entry;
+
+	/* Vaidate that security profile is enabled */
+	if (!hostapd_sec_prof_enabled(hapd->conf, sta_profile_num)) {
+		wpa_printf(MSG_INFO,
+			   "Station " MACSTR
+			   " security profile number %d not enabled in AP's configuration",
+			   MAC2STR(sta->addr), sta_profile_num);
+		return false;
+	}
+
+	/* Validate that the profile number is known */
+	entry = sec_prof_get(sta_profile_num);
+	if (!entry) {
+		wpa_printf(MSG_INFO, "Unsupported security profile %d",
+			   sta_profile_num);
+		return false;
+	}
+
+	/* Validate RSNE fields */
+	if (!(entry->key_mgmt & rsne_data->key_mgmt)) {
+		wpa_printf(MSG_DEBUG,
+			   "Security profile number %d key_mgmt mismatch: required=0x%x got=0x%x",
+			   sta_profile_num, entry->key_mgmt,
+			   rsne_data->key_mgmt);
+		return false;
+	}
+
+#ifdef CONFIG_PASN
+	if ((entry->key_mgmt == (WPA_KEY_MGMT_EPPKE |
+				 WPA_KEY_MGMT_SAE_EXT_KEY) ||
+	     entry->key_mgmt == (WPA_KEY_MGMT_EPPKE |
+				 WPA_KEY_MGMT_FT_SAE_EXT_KEY)) &&
+	    assoc && sta->pasn && !wpa_key_mgmt_sae(sta->pasn->akmp)) {
+		wpa_printf(MSG_DEBUG,
+			   "Station " MACSTR
+			   " security profile number %d requires authentication with EPPKE, but STA used unauthenticated EPPKE",
+			   MAC2STR(sta->addr), sta_profile_num);
+		return false;
+	}
+#endif /* CONFIG_PASN */
+
+	if (!(entry->pairwise_cipher & rsne_data->pairwise_cipher)) {
+		wpa_printf(MSG_DEBUG,
+			   "Security profile number %d pairwise cipher mismatch: required=0x%x got=0x%x",
+			   sta_profile_num, entry->pairwise_cipher,
+			   rsne_data->pairwise_cipher);
+		return false;
+	}
+
+	if (!(rsne_data->capabilities & WPA_CAPABILITY_MFPC)) {
+		wpa_printf(MSG_DEBUG,
+			   "RSN: Security profile use without MFP is not allowed");
+		return false;
+	}
+
+	/* Validate RSNXE fields */
+	if (entry->ieee8021x_auth_frame &&
+	    !ieee802_11_rsnx_capab_len(rsnxe, rsnxe_len,
+				       WLAN_RSNX_CAPAB_802_1X_IN_AUTH_FRAMES)) {
+		wpa_printf(MSG_DEBUG,
+			   "Security profile number %d 8021x_auth_frame capab missing",
+			   sta_profile_num);
+		return false;
+	}
+
+	if (entry->assoc_frame_encrypt &&
+	    !ieee802_11_rsnx_capab_len(rsnxe, rsnxe_len,
+				       WLAN_RSNX_CAPAB_ASSOC_FRAME_ENCRYPTION))
+	{
+		wpa_printf(MSG_DEBUG,
+			   "Security profile number %d assoc_frame_encrypt capab missing",
+			   sta_profile_num);
+		return false;
+	}
+
+	if (entry->assoc_frame_encrypt && !ap_sta_is_epp(sta)) {
+		wpa_printf(MSG_DEBUG,
+			   "STA used security profile number %d that requires EPP, but did not use EPP",
+			   sta_profile_num);
+		return false;
+	}
+
+	if (assoc && entry->assoc_frame_encrypt &&
+	    entry->key_mgmt == (WPA_KEY_MGMT_EPPKE |
+				WPA_KEY_MGMT_SAE_EXT_KEY) &&
+	    sta->auth_alg != WLAN_AUTH_EPPKE &&
+	    rsne_data->key_mgmt != WPA_KEY_MGMT_EPPKE) {
+		wpa_printf(MSG_DEBUG,
+			   "Security profile number %d requires EPPKE[SAE], but STA used SAE-EXT-KEY without EPPKE",
+			   sta_profile_num);
+		return false;
+	}
+
+	if (entry->pmksa_caching_privacy &&
+	    !ieee802_11_rsnx_capab_len(rsnxe, rsnxe_len,
+				       WLAN_RSNX_CAPAB_PMKSA_CACHING_PRIVACY)) {
+		wpa_printf(MSG_DEBUG,
+			   "Security profile number %d pmksa_caching_privacy capab missing",
+			   sta_profile_num);
+		return false;
+	}
+
+	wpa_printf(MSG_DEBUG,
+		   "Station " MACSTR
+		   " indicated security profile number %d matches (key_mgmt=0x%x cipher=0x%x)",
+		   MAC2STR(sta->addr), sta_profile_num,
+		   entry->key_mgmt, entry->pairwise_cipher);
+	if (profile_matched)
+		*profile_matched = entry;
+	return true;
+}
+
+
+/**
+ * validate_sta_security_profile - Validate STA's Security Profile element
+ * @hapd: AP data
+ * @sta: Station
+ * @assoc: Whether this is for (Re)Association Request frame
+ * @wpa_ie: STA's RSNE (including EID and Length)
+ * @wpa_ie_len: Length of wpa_ie
+ * @rsnxe: STA's RSNXE (including EID and Length), or NULL
+ * @rsnxe_len: Length of rsnxe (unused; rsnxe already includes EID+Len)
+ * @sec_prof: Body of STA's Security Profile element (after EID_Ext byte)
+ * @sec_prof_len: Length of sec_prof
+ * @profile_matched: On success, returns the matched profile entry
+ * Returns: Whether validation passes
+ *
+ * Validates that the STA's indicated security profile matches one of the
+ * AP's advertised profiles and that the RSNE/RSNXE fields are consistent.
+ */
+static bool validate_sta_security_profile(
+	struct hostapd_data *hapd, struct sta_info *sta, bool assoc,
+	const u8 *rsne, size_t rsne_len,
+	const u8 *rsnxe, size_t rsnxe_len,
+	const u8 *sec_prof, size_t sec_prof_len,
+	const struct security_profile_entry **profile_matched)
+{
+	struct wpa_ie_data data;
+	int sta_profile_num;
+
+	if (!hapd->conf->security_profiles)
+		return true; /* No profiles configured, allow */
+
+	wpa_printf(MSG_DEBUG, "Validating security profile for STA " MACSTR,
+		   MAC2STR(sta->addr));
+
+	/* Parse station's RSNE */
+	if (!rsne || rsne_len < 2) {
+		wpa_printf(MSG_INFO, "Station " MACSTR
+			   " using security profiles without RSNE",
+			   MAC2STR(sta->addr));
+		return false;
+	}
+
+	if (wpa_parse_wpa_ie_rsn(rsne - 2, rsne_len + 2, &data) < 0) {
+		wpa_printf(MSG_INFO, "Station " MACSTR " used an invalid RSNE",
+			   MAC2STR(sta->addr));
+		return false;
+	}
+
+	/* Extract STA's profile number from Security Profile element */
+	sta_profile_num = get_sta_profile_num(sec_prof, sec_prof_len);
+	if (sta_profile_num < 0) {
+		wpa_printf(MSG_INFO,
+			   "Station " MACSTR
+			   " did not indicate a valid security profile number",
+			   MAC2STR(sta->addr));
+		return false;
+	}
+
+	wpa_printf(MSG_DEBUG, "STA " MACSTR " profile number: %d",
+		   MAC2STR(sta->addr), sta_profile_num);
+
+	/* Use the helper function to find and validate the profile */
+	return find_and_validate_profile(hapd, sta, assoc, sta_profile_num,
+					 &data, rsnxe, rsnxe_len,
+					 profile_matched);
+}
+
+
+/**
+ * validate_security_profile - Security Profile validation
+ * @hapd: hostapd BSS data structure
+ * @sta: Station
+ * @assoc: Whether this is for (Re)Association Request frame
+ * @elems: Pre-parsed elements (caller is responsible for parsing)
+ * @auth_context: Authentication context string (e.g., "SAE", "PASN", "802.1X")
+ * @profile_matched: On success, returns the matched profile entry
+ * Returns: WLAN_STATUS_SUCCESS on success or validation not needed,
+ *	    WLAN_STATUS_REJECTED_INVALID_SECURITY_PROFILE on validation failure
+ *
+ * This helper function consolidates the common Security Profile validation
+ * logic used across different authentication methods (SAE, PASN, IEEE 802.1X).
+ */
+static u16 validate_security_profile(
+	struct hostapd_data *hapd,
+	struct sta_info *sta,
+	bool assoc,
+	struct ieee802_11_elems *elems,
+	const char *auth_context,
+	const struct security_profile_entry **profile_matched)
+{
+	/* Skip validation if no Security Profiles are configured */
+	if (!hapd->conf->security_profiles)
+		return WLAN_STATUS_SUCCESS;
+
+	if (!elems->security_profile) {
+		/* No Security Profile element present - validation not needed
+		 */
+		return WLAN_STATUS_SUCCESS;
+	}
+
+	wpa_printf(MSG_DEBUG,
+		   "Validating Security Profile element from " MACSTR
+		   " in %s auth (body_len=%u)",
+		   MAC2STR(sta->addr), auth_context,
+		   elems->security_profile_len);
+
+	/* Perform validation */
+	if (!validate_sta_security_profile(
+		    hapd, sta, assoc,
+		    elems->rsn_ie, elems->rsn_ie_len,
+		    elems->rsnxe, elems->rsnxe_len,
+		    elems->security_profile, elems->security_profile_len,
+		    profile_matched)) {
+		wpa_printf(MSG_INFO,
+			   "Rejecting %s auth from " MACSTR
+			   " - Security Profile element mismatch",
+			   auth_context, MAC2STR(sta->addr));
+		return WLAN_STATUS_REJECTED_INVALID_SECURITY_PROFILE;
+	}
+
+	wpa_printf(MSG_DEBUG,
+		   "Security Profile element validated for " MACSTR
+		   " in %s auth",
+		   MAC2STR(sta->addr), auth_context);
+
+#ifdef CONFIG_PASN
+	sta->sec_prof_used = true;
+#endif /* CONFIG_PASN */
+
+	return WLAN_STATUS_SUCCESS;
 }
 
 
@@ -389,10 +733,11 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	 */
 	if (auth_alg == WLAN_AUTH_802_1X &&
 	    (resp == WLAN_STATUS_802_1_X_AUTH_SUCCESS ||
-	     sta->eap_auth_data.add_mic)) {
+	     (sta && sta->eap_auth_data.add_mic))) {
 		mic_len = wpa_mic_len(sta->eap_auth_data.akm,
 				      sta->eap_auth_data.pmk_len,
-				      RSN_HASH_NOT_SPECIFIED);
+				      RSN_HASH_NOT_SPECIFIED,
+				      PASN_GROUP_NOT_SPECIFIED);
 		rlen += 2 + mic_len;
 	}
 #endif /* CONFIG_IEEE8021X_AUTH */
@@ -465,7 +810,7 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 #ifdef CONFIG_IEEE8021X_AUTH
 	if (auth_alg == WLAN_AUTH_802_1X &&
 	    (resp == WLAN_STATUS_802_1_X_AUTH_SUCCESS ||
-	     sta->eap_auth_data.add_mic)) {
+	     (sta && sta->eap_auth_data.add_mic))) {
 		const u8 *frame, *data, *rsne, *rsnxe;
 		u8 data_buf[500], mic[WPA_1X_MAX_MIC_LEN];
 		size_t frame_len, data_len;
@@ -480,6 +825,7 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 		rsne = hostapd_wpa_ie(hapd, WLAN_EID_RSN);
 		if (!rsne) {
 			wpa_printf(MSG_INFO, "No AP RSNE");
+			os_free(buf);
 			return -1;
 		}
 		os_memcpy(data_buf, rsne, 2 + rsne[1]);
@@ -508,6 +854,7 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 				       aa, sta->addr, data, data_len,
 				       frame, frame_len, mic)) {
 			wpa_printf(MSG_INFO, "Failed to derive MIC");
+			os_free(buf);
 			return -1;
 		}
 		os_memcpy(ptr + 2, mic, mic_len);
@@ -1608,9 +1955,7 @@ static void sae_pick_next_group(struct hostapd_data *hapd, struct sta_info *sta)
 
 	if (!groups) {
 		groups = default_groups;
-		if (wpa_key_mgmt_sae_ext_key(conf->wpa_key_mgmt |
-					     conf->rsn_override_key_mgmt |
-					     conf->rsn_override_key_mgmt_2))
+		if (hostapd_config_sae_ext_key(conf))
 			default_groups[1] = 20;
 	}
 
@@ -1685,9 +2030,7 @@ static int sae_is_group_enabled(struct hostapd_data *hapd, int group)
 
 	if (!groups) {
 		groups = default_groups;
-		if (wpa_key_mgmt_sae_ext_key(conf->wpa_key_mgmt |
-					     conf->rsn_override_key_mgmt |
-					     conf->rsn_override_key_mgmt_2))
+		if (hostapd_config_sae_ext_key(conf))
 			default_groups[1] = 20;
 	}
 
@@ -1755,9 +2098,7 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
 
 	if (!groups) {
 		groups = default_groups;
-		if (wpa_key_mgmt_sae_ext_key(conf->wpa_key_mgmt |
-					     conf->rsn_override_key_mgmt |
-					     conf->rsn_override_key_mgmt_2))
+		if (hostapd_config_sae_ext_key(conf))
 			default_groups[1] = 20;
 	}
 
@@ -1817,6 +2158,7 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
 		const u8 *token = NULL;
 		size_t token_len = 0;
 		int allow_reuse = 0;
+		int ie_offset = 0;
 
 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
 			       HOSTAPD_LEVEL_DEBUG,
@@ -1927,7 +2269,7 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
 					&token_len, groups, status_code ==
 					WLAN_STATUS_SAE_HASH_TO_ELEMENT ||
 					status_code == WLAN_STATUS_SAE_PK,
-					NULL);
+					&ie_offset);
 		if (resp == SAE_SILENTLY_DISCARD) {
 			wpa_printf(MSG_DEBUG,
 				   "SAE: Drop commit message from " MACSTR " due to reflection attack",
@@ -1965,6 +2307,27 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
 		if (check_sae_rejected_groups(hapd, sta->sae)) {
 			resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
 			goto reply;
+		}
+
+		if (hapd->conf->security_profiles) {
+			struct ieee802_11_elems elems;
+			const u8 *ies;
+			size_t ies_len;
+
+			ies = mgmt->u.auth.variable + ie_offset;
+			ies_len = ((const u8 *) mgmt) + len -
+				mgmt->u.auth.variable - ie_offset;
+			if (ieee802_11_parse_elems(ies, ies_len, &elems, 1) ==
+			    ParseFailed) {
+				wpa_printf(MSG_DEBUG,
+					   "Failed to parse elements");
+				resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
+				goto reply;
+			}
+			resp = validate_security_profile(
+				hapd, sta, false, &elems, "SAE", NULL);
+			if (resp != WLAN_STATUS_SUCCESS)
+				goto reply;
 		}
 
 		if (!token && use_anti_clogging(hapd) && !allow_reuse) {
@@ -2447,7 +2810,9 @@ u16 wpa_auth_validate_802_1x_frame(struct hostapd_data *hapd,
 		wpa_printf(MSG_DEBUG, "Received pairwise cipher (0x%x) in RSNE",
 			   rsn.pairwise_cipher);
 
-		if (!(rsn.key_mgmt & hapd->conf->wpa_key_mgmt)) {
+		if (!(rsn.key_mgmt &
+		      (hapd->conf->wpa_key_mgmt |
+		       hostapd_config_sp_key_mgmt(hapd->conf)))) {
 			wpa_printf(MSG_INFO, "Invalid key mgmt (0x%x) in RSNE",
 				   rsn.key_mgmt);
 			return WPA_INVALID_AKMP;
@@ -2698,6 +3063,23 @@ static void handle_auth_802_1x(struct hostapd_data *hapd, struct sta_info *sta,
 	const u8 *end;
 	struct wpabuf *reply;
 
+	/*
+	 * A peer that does not receive the response in time might retransmit
+	 * the Authentication frame with a new sequence number. Since the local
+	 * state machine has already advanced, reprocessing such a frame would
+	 * fail (sending a response to the peer that would terminate the
+	 * connection). Ignore retransmissions of old Authentication frames.
+	 */
+	if (auth_transaction == 1) {
+		sta->eap_auth_data.auth_transaction = 0;
+	} else if (auth_transaction <= sta->eap_auth_data.auth_transaction) {
+		wpa_printf(MSG_DEBUG,
+			   "IEEE 802.1X: Drop retransmitted Authentication frame (transaction %u <= %u)",
+			   auth_transaction,
+			   sta->eap_auth_data.auth_transaction);
+		return;
+	}
+
 	if (len < 2) {
 		wpa_printf(MSG_INFO, "Missing Encapsulation Length field");
 		resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
@@ -2748,6 +3130,29 @@ static void handle_auth_802_1x(struct hostapd_data *hapd, struct sta_info *sta,
 		resp = wpa_auth_validate_802_1x_frame(hapd, sta, &elems);
 		if (resp)
 			goto fail;
+
+		/* Validate Security Profile element, if present */
+		if (hapd->conf->security_profiles && elems.security_profile) {
+			wpa_hexdump(MSG_DEBUG,
+				    "STA Security Profile element body in 802.1X auth",
+				    elems.security_profile,
+				    elems.security_profile_len);
+
+			if (!validate_sta_security_profile(
+				    hapd, sta, false,
+				    elems.rsn_ie, elems.rsn_ie_len,
+				    elems.rsnxe, elems.rsnxe_len,
+				    elems.security_profile,
+				    elems.security_profile_len,
+				    NULL)) {
+				wpa_printf(MSG_INFO,
+					   "Rejecting 802.1X auth from " MACSTR
+					   " - Security Profile element mismatch",
+					   MAC2STR(sta->addr));
+				resp = WLAN_STATUS_REJECTED_INVALID_SECURITY_PROFILE;
+				goto fail;
+			}
+		}
 
 		enc_assoc = ap_sta_support_enc_assoc(hapd, elems.rsnxe,
 						     elems.rsnxe_len);
@@ -3015,7 +3420,7 @@ void handle_auth_fils(struct hostapd_data *hapd, struct sta_info *sta,
 				  elems.rsnxe ? elems.rsnxe - 2 : NULL,
 				  elems.rsnxe ? elems.rsnxe_len + 2 : 0,
 				  elems.mdie, elems.mdie_len, NULL, 0, NULL,
-				  ap_sta_is_mld(hapd, sta));
+				  ap_sta_is_mld(hapd, sta), NULL);
 	resp = wpa_res_to_status_code(res);
 	if (resp != WLAN_STATUS_SUCCESS)
 		goto fail;
@@ -3106,6 +3511,13 @@ void handle_auth_fils(struct hostapd_data *hapd, struct sta_info *sta,
 			goto fail;
 #endif /* CONFIG_NO_RADIUS */
 		}
+	}
+
+	if (hapd->conf->security_profiles) {
+		resp = validate_security_profile(hapd, sta, false, &elems,
+						 "FILS", NULL);
+		if (!resp)
+			goto fail;
 	}
 
 fail:
@@ -3907,8 +4319,9 @@ static void hapd_initialize_pasn(struct hostapd_data *hapd,
 		pasn_set_own_mld_addr(pasn, hapd->mld->mld_addr);
 #endif /* CONFIG_IEEE80211BE && CONFIG_ENC_ASSOC */
 	pasn_set_peer_addr(pasn, sta->addr);
-	pasn_set_wpa_key_mgmt(pasn, hapd->conf->wpa_key_mgmt);
-	pasn_set_rsn_pairwise(pasn, hapd->conf->rsn_pairwise);
+	pasn_set_wpa_key_mgmt(pasn, hostapd_config_all_key_mgmt(hapd->conf));
+	pasn_set_rsn_pairwise(pasn, hapd->conf->rsn_pairwise |
+			      hapd->conf->rsn_override_pairwise);
 	pasn_set_mfp(pasn, hapd->conf->ieee80211w);
 	os_free(pasn->pasn_groups);
 	pasn->pasn_groups = int_array_dup(hapd->conf->pasn_groups);
@@ -3951,6 +4364,8 @@ static void hapd_initialize_pasn(struct hostapd_data *hapd,
 	pasn->comeback_idx = hapd->comeback_idx;
 	pasn->comeback_key =  hapd->comeback_key;
 	pasn->comeback_pending_idx = hapd->comeback_pending_idx;
+
+	pasn->sec_prof_enabled = hapd->conf->security_profiles;
 }
 
 
@@ -4016,10 +4431,22 @@ static void hapd_pasn_update_params(struct hostapd_data *hapd,
 		return;
 	}
 
-	if (!(rsn_data.key_mgmt & pasn->wpa_key_mgmt) ||
-	    !(rsn_data.pairwise_cipher & pasn->rsn_pairwise)) {
-		wpa_printf(MSG_DEBUG, "PASN: Mismatch in AKMP/cipher");
+	if (!(rsn_data.key_mgmt & pasn->wpa_key_mgmt)) {
+		wpa_printf(MSG_DEBUG, "PASN: Mismatch in AKMP");
 		return;
+	}
+
+	if (hapd->conf->security_profiles && sta->sec_prof_used) {
+		if (!(rsn_data.pairwise_cipher & WPA_CIPHER_GCMP_256)) {
+			wpa_printf(MSG_DEBUG,
+				   "PASN: Pairwise cipher not allowed for security profile");
+			return;
+		}
+	} else {
+		if (!(rsn_data.pairwise_cipher & pasn->rsn_pairwise)) {
+			wpa_printf(MSG_DEBUG, "PASN: Mismatch in cipher");
+			return;
+		}
 	}
 
 #ifdef CONFIG_ENC_ASSOC
@@ -4088,10 +4515,9 @@ static void handle_auth_pasn(struct hostapd_data *hapd, struct sta_info *sta,
 			     u16 trans_seq, u16 status)
 {
 	int ret;
-#ifdef CONFIG_P2P
 	struct ieee802_11_elems elems;
 
-	if (len < 24) {
+	if (len < offsetof(struct ieee80211_mgmt, u.auth.variable)) {
 		wpa_printf(MSG_DEBUG, "PASN: Too short Management frame");
 		return;
 	}
@@ -4105,6 +4531,7 @@ static void handle_auth_pasn(struct hostapd_data *hapd, struct sta_info *sta,
 		return;
 	}
 
+#ifdef CONFIG_P2P
 	if ((hapd->conf->p2p & (P2P_ENABLED | P2P_GROUP_OWNER)) ==
 	    (P2P_ENABLED | P2P_GROUP_OWNER) &&
 	    hapd->p2p && elems.p2p2_ie && elems.p2p2_ie_len) {
@@ -4143,6 +4570,32 @@ static void handle_auth_pasn(struct hostapd_data *hapd, struct sta_info *sta,
 		}
 
 		hapd_initialize_pasn(hapd, sta);
+
+		/* Security Profile element validation during PASN frame 1.
+		 * If the first Authentication frame includes an RSNE, RSNXE,
+		 * and a Security Profile element the AP must verify these
+		 * match an advertised profile; reject with
+		 * REJECTED_INVALID_SECURITY_PROFILE on mismatch.
+		 */
+		if (hapd->conf->security_profiles &&
+		    validate_security_profile(hapd, sta, false, &elems, "PASN",
+					      NULL)) {
+			wpa_printf(MSG_INFO, "PASN: Rejecting auth from " MACSTR
+				   " - security profile mismatch",
+				   MAC2STR(sta->addr));
+			send_auth_reply(
+				hapd, sta, sta->addr,
+				le_to_host16(mgmt->u.auth.auth_alg),
+				WLAN_AUTH_TR_SEQ_PASN_AUTH2,
+				WLAN_STATUS_REJECTED_INVALID_SECURITY_PROFILE,
+				NULL, 0,
+				"pasn-sec-profile-reject");
+			ap_free_sta(hapd, sta);
+			return;
+		}
+
+		if (sta->sec_prof_used)
+			sta->pasn->sec_prof_used = true;
 
 		hapd_pasn_update_params(hapd, sta, mgmt, len);
 		ret = handle_auth_pasn_1(sta->pasn, hapd->own_addr, sta->addr,
@@ -4320,9 +4773,7 @@ static void handle_auth(struct hostapd_data *hapd,
 #endif /* CONFIG_IEEE80211R_AP */
 #ifdef CONFIG_SAE
 	      (hapd->conf->wpa &&
-	       wpa_key_mgmt_sae(hapd->conf->wpa_key_mgmt |
-				hapd->conf->rsn_override_key_mgmt |
-				hapd->conf->rsn_override_key_mgmt_2) &&
+	       wpa_key_mgmt_sae(hostapd_config_all_key_mgmt(hapd->conf)) &&
 	       auth_alg == WLAN_AUTH_SAE) ||
 #endif /* CONFIG_SAE */
 #ifdef CONFIG_FILS
@@ -4339,7 +4790,8 @@ static void handle_auth(struct hostapd_data *hapd,
 #endif /* CONFIG_PASN */
 #ifdef CONFIG_ENC_ASSOC
 	      (hapd->conf->wpa &&
-	       (hapd->conf->wpa_key_mgmt & WPA_KEY_MGMT_EPPKE) &&
+	       ((hostapd_config_all_key_mgmt(hapd->conf)) &
+		WPA_KEY_MGMT_EPPKE) &&
 	       hapd->conf->assoc_frame_encryption &&
 	       auth_alg == WLAN_AUTH_EPPKE) ||
 #endif /* CONFIG_ENC_ASSOC */
@@ -4579,10 +5031,10 @@ static void handle_auth(struct hostapd_data *hapd,
 		     !ap_sta_is_authorized(sta)) && sta->wpa_sm) {
 			struct wpa_state_machine *sm = sta->wpa_sm;
 
+			clear_wpa_sm_for_each_partner_link(hapd, sta);
 			clear_wpa_sm_for_all_sta(hapd, sm);
 			wpa_auth_sta_deinit(sm);
 			sta->wpa_sm = NULL;
-			clear_wpa_sm_for_each_partner_link(hapd, sta);
 		}
 	}
 #endif /* CONFIG_IEEE80211BE */
@@ -4677,6 +5129,23 @@ static void handle_auth(struct hostapd_data *hapd,
 			resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
 			goto fail;
 		}
+		if (hapd->conf->security_profiles) {
+			struct ieee802_11_elems elems;
+			size_t auth_var_len = len - IEEE80211_HDRLEN -
+				sizeof(mgmt->u.auth);
+
+			if (ieee802_11_parse_elems(mgmt->u.auth.variable,
+						   auth_var_len, &elems,
+						   1) == ParseFailed) {
+				wpa_printf(MSG_DEBUG,
+					   "Failed to parse elements in %s",
+					   __func__);
+				goto fail;
+			}
+			if (validate_security_profile(hapd, sta, false, &elems,
+						      "FT", NULL))
+				goto fail;
+		}
 		wpa_ft_process_auth(sta->wpa_sm,
 				    auth_transaction, mgmt->u.auth.variable,
 				    len - IEEE80211_HDRLEN -
@@ -4732,6 +5201,22 @@ static void handle_auth(struct hostapd_data *hapd,
 				 status_code);
 		return;
 #endif /* CONFIG_PASN */
+	}
+
+	if (hapd->conf->security_profiles) {
+		struct ieee802_11_elems elems;
+		size_t auth_var_len = len - IEEE80211_HDRLEN -
+			sizeof(mgmt->u.auth);
+
+		if (ieee802_11_parse_elems(mgmt->u.auth.variable, auth_var_len,
+					   &elems, 1) == ParseFailed) {
+			wpa_printf(MSG_DEBUG, "Failed to parse elements in %s",
+				   __func__);
+			goto fail;
+		}
+		if (validate_security_profile(hapd, sta, false, &elems,
+					      "Other auth_alg", NULL))
+			goto fail;
 	}
 
  fail:
@@ -4810,6 +5295,67 @@ static u32 hostapd_get_aid_word(struct hostapd_data *hapd,
 
 	return hapd->sta_aid[i];
 }
+
+
+#ifdef CONFIG_IEEE80211BE
+static int hostapd_get_wds_mld_ifname_id(struct hostapd_data *hapd,
+					 struct sta_info *sta)
+{
+	struct hostapd_mld *mld = hapd->mld;
+	struct hostapd_data *link_bss;
+	struct sta_info *link_sta;
+	int i, j = 32, ifname_id;
+
+	if (sta->wds_ifname_id > 0) {
+		wpa_printf(MSG_DEBUG, "  old WDS ifname_id %d",
+			   sta->wds_ifname_id);
+		return 0;
+	}
+
+	if (!mld) {
+		wpa_printf(MSG_ERROR,
+			   "MLD structure not available for WDS ifname_id allocation");
+		return -1;
+	}
+
+	for_each_mld_link(link_bss, hapd) {
+		link_sta = ap_get_sta(link_bss, sta->addr);
+		if (link_sta && link_sta != sta &&
+		    link_sta->wds_ifname_id > 0) {
+			sta->wds_ifname_id = link_sta->wds_ifname_id;
+			wpa_printf(MSG_DEBUG,
+				   "  reusing WDS ifname_id %d from another link",
+				   sta->wds_ifname_id);
+			return 0;
+		}
+	}
+
+	for (i = 0; i < AID_WORDS; i++) {
+		if (mld->wds_ifname_id[i] == (u32) -1)
+			continue;
+
+		for (j = 0; j < 32; j++) {
+			if (!(mld->wds_ifname_id[i] & BIT(j)))
+				break;
+		}
+
+		if (j < 32)
+			break;
+	}
+
+	if (i == AID_WORDS)
+		return -1;
+
+	ifname_id = i * 32 + j + 1;
+	if (ifname_id > 2007)
+		return -1;
+
+	sta->wds_ifname_id = ifname_id;
+	mld->wds_ifname_id[i] |= BIT(j);
+	wpa_printf(MSG_DEBUG, "  new WDS ifname_id %d", sta->wds_ifname_id);
+	return 0;
+}
+#endif /* CONFIG_IEEE80211BE */
 
 
 int hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
@@ -5261,7 +5807,7 @@ u16 owe_process_rsn_ie(struct hostapd_data *hapd,
 	res = wpa_validate_wpa_ie(hapd->wpa_auth, sta->wpa_sm,
 				  hapd->iface->freq, rsn_ie, rsn_ie_len,
 				  NULL, 0, NULL, 0, owe_dh, owe_dh_len, NULL,
-				  ap_sta_is_mld(hapd, sta));
+				  ap_sta_is_mld(hapd, sta), NULL);
 	status = wpa_res_to_status_code(res);
 	if (status != WLAN_STATUS_SUCCESS)
 		goto end;
@@ -5415,6 +5961,7 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
 	const u8 *wpa_ie;
 	size_t wpa_ie_len;
 	const u8 *p2p_dev_addr = NULL;
+	const struct security_profile_entry *matched_profile = NULL;
 #ifdef CONFIG_PMKSA_PRIVACY
 	bool derive_next_pmkid = true;
 #endif /* CONFIG_PMKSA_PRIVACY */
@@ -5532,7 +6079,8 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
 		if (resp != WLAN_STATUS_SUCCESS)
 			goto out;
 
-		if (hapd->iconf->require_eht && !(sta->flags & WLAN_STA_EHT)) {
+		if ((hapd->iconf->require_eht || hapd->conf->bss_require_eht) &&
+		    !(sta->flags & WLAN_STA_EHT)) {
 			hostapd_logger(hapd, sta->addr,
 				       HOSTAPD_MODULE_IEEE80211,
 				       HOSTAPD_LEVEL_INFO,
@@ -5620,6 +6168,20 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
 		if (ap_sta_is_mld(hapd, sta))
 			aa = hapd->mld->mld_addr;
 #endif /* CONFIG_IEEE80211BE */
+
+		if (hapd->conf->security_profiles) {
+			resp = validate_security_profile(
+				hapd, sta, true, elems,
+				type == LINK_PARSE_REASSOC ?
+				"Reassoc" : "Assoc", &matched_profile);
+			if (resp != WLAN_STATUS_SUCCESS) {
+				resp = WLAN_STATUS_REJECTED_INVALID_SECURITY_PROFILE;
+				goto out;
+			}
+			wpa_printf(MSG_DEBUG,
+				   "(Re)Association Request frame Security Profile validated for "
+				   MACSTR, MAC2STR(sta->addr));
+		}
 
 		os_memcpy(data_buf, elems->rsn_ie - 2, elems->rsn_ie_len + 2);
 		data_len += 2 + elems->rsn_ie_len;
@@ -5749,6 +6311,34 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
 					       sta->sae_pw_id_counter);
 		wpa_auth_set_rsn_selection(sta->wpa_sm, elems->rsn_selection,
 					   elems->rsn_selection_len);
+
+		/*
+		 * Security profile validation for SAE and other non-802.1X
+		 * authentication methods. For 802.1X, this is done above in the
+		 * CONFIG_IEEE8021X_AUTH block. For SAE, the security profile
+		 * was validated during the authentication phase, but we need to
+		 * set get the matched profile here so that
+		 * wpa_validate_wpa_ie() uses the profile's pairwise cipher
+		 * (GCMP-256) instead of the AP's rsn_pairwise setting.
+		 */
+		if (hapd->conf->security_profiles && !matched_profile &&
+		    elems->security_profile) {
+			u16 sp_resp = validate_security_profile(
+				hapd, sta, true, elems,
+				type == LINK_PARSE_REASSOC ?
+				"Reassoc" : "Assoc", &matched_profile);
+
+			if (sp_resp != WLAN_STATUS_SUCCESS) {
+				resp = WLAN_STATUS_REJECTED_INVALID_SECURITY_PROFILE;
+				goto out;
+			}
+			wpa_printf(MSG_DEBUG,
+				   "Security Profile validated for "
+				   MACSTR
+				   " in (Re)Association Request frame",
+				   MAC2STR(sta->addr));
+		}
+
 		res = wpa_validate_wpa_ie(hapd->wpa_auth, sta->wpa_sm,
 					  hapd->iface->freq,
 					  wpa_ie, wpa_ie_len,
@@ -5759,7 +6349,8 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
 					  elems->mdie, elems->mdie_len,
 					  elems->owe_dh, elems->owe_dh_len,
 					  assoc_wpa_sm,
-					  ap_sta_is_mld(hapd, sta));
+					  ap_sta_is_mld(hapd, sta),
+					  matched_profile);
 		resp = wpa_res_to_status_code(res);
 		if (resp != WLAN_STATUS_SUCCESS)
 			goto out;
@@ -5914,20 +6505,26 @@ skip_pmkid_update:
 		if (hapd->conf->sae_pwe == SAE_PWE_BOTH &&
 		    sta->auth_alg == WLAN_AUTH_SAE &&
 		    sta->sae && !sta->sae->h2e &&
+		    (hapd->conf->rsnxe_capab_mask &
+		     BIT_ULL(WLAN_RSNX_CAPAB_SAE_H2E)) &&
 		    ieee802_11_rsnx_capab_len(elems->rsnxe, elems->rsnxe_len,
 					      WLAN_RSNX_CAPAB_SAE_H2E)) {
-			wpa_printf(MSG_INFO, "SAE: " MACSTR
-				   " indicates support for SAE H2E, but did not use it",
-				   MAC2STR(sta->addr));
-			resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
-			goto out;
+			if (hapd->conf->sae_accept_h2e_without_use) {
+				wpa_printf(MSG_INFO, "SAE: " MACSTR
+					   " indicates support for SAE H2E, but did not use it - accepting due to sae_accept_h2e_without_use",
+					   MAC2STR(sta->addr));
+			} else {
+				wpa_printf(MSG_INFO, "SAE: " MACSTR
+					   " indicates support for SAE H2E, but did not use it",
+					   MAC2STR(sta->addr));
+				resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
+				goto out;
+			}
 		}
 #endif /* CONFIG_SAE */
 
 #ifdef CONFIG_OWE
-		if (((hapd->conf->wpa_key_mgmt |
-		      hapd->conf->rsn_override_key_mgmt |
-		      hapd->conf->rsn_override_key_mgmt_2) &
+		if (((hostapd_config_all_key_mgmt(hapd->conf)) &
 		     WPA_KEY_MGMT_OWE) &&
 		    wpa_auth_sta_key_mgmt(sta->wpa_sm) == WPA_KEY_MGMT_OWE &&
 		    elems->owe_dh) {
@@ -6134,6 +6731,7 @@ out:
 		struct wpa_state_machine *sm = sta->wpa_sm;
 
 #ifdef CONFIG_IEEE80211BE
+		clear_wpa_sm_for_each_partner_link(hapd, sta);
 		clear_wpa_sm_for_all_sta(hapd, sm);
 #endif /* CONFIG_IEEE80211BE */
 
@@ -6156,6 +6754,9 @@ out:
 #endif /* CONFIG_IEEE80211BE */
 		}
 	}
+
+	if (resp == WLAN_STATUS_SUCCESS && matched_profile)
+		wpa_auth_set_security_profile(sta->wpa_sm, matched_profile);
 
 	return resp;
 }
@@ -6181,8 +6782,11 @@ static int check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
 #ifdef CONFIG_IEEE80211BE
 
 void ieee80211_ml_build_assoc_resp(struct hostapd_data *hapd,
-				   struct mld_link_info *link)
+				   struct mld_link_info *link,
+				   struct sta_info *sta)
 {
+	struct hostapd_data *assoc_hapd;
+	struct sta_info *assoc_sta;
 	u8 buf[EHT_ML_MAX_STA_PROF_LEN];
 	u8 *p = buf;
 	size_t buflen = sizeof(buf);
@@ -6224,6 +6828,68 @@ void ieee80211_ml_build_assoc_resp(struct hostapd_data *hapd,
 
 	p = hostapd_eid_ext_capab(hapd, p, false);
 
+
+	assoc_sta = hostapd_ml_get_assoc_sta(hapd, sta, &assoc_hapd);
+	if (assoc_sta && hapd != assoc_hapd) {
+		const u8 *rsnxe, *assoc_rsnxe;
+#ifdef CONFIG_ENC_ASSOC
+		const u8 *rsne, *assoc_rsne;
+#endif /* CONFIG_ENC_ASSOC */
+		u8 ie_count = 0, non_inherit_ie[2];
+
+		rsnxe = hostapd_wpa_ie(hapd, WLAN_EID_RSNX);
+		assoc_rsnxe = hostapd_wpa_ie(assoc_hapd, WLAN_EID_RSNX);
+#ifdef CONFIG_ENC_ASSOC
+		rsne = hostapd_wpa_ie(hapd, WLAN_EID_RSN);
+		assoc_rsne = hostapd_wpa_ie(assoc_hapd, WLAN_EID_RSN);
+#endif /* CONFIG_ENC_ASSOC */
+
+		if (assoc_hapd->conf->rsn_override_omit_rsnxe)
+			goto omit_rsnxe;
+
+		if (assoc_rsnxe && !rsnxe)
+			non_inherit_ie[ie_count++] = WLAN_EID_RSNX;
+
+		if ((!assoc_rsnxe && rsnxe) ||
+		    (rsnxe && assoc_rsnxe &&
+		     (rsnxe[1] != assoc_rsnxe[1] ||
+		      os_memcmp(rsnxe, assoc_rsnxe, 2 + rsnxe[1]) != 0))) {
+			size_t rsnx_ie_len;
+
+			rsnx_ie_len = 2 + rsnxe[1];
+			if ((size_t) (buf + buflen - p) >= rsnx_ie_len) {
+				os_memcpy(p, rsnxe, rsnx_ie_len);
+				p += rsnx_ie_len;
+			}
+		}
+omit_rsnxe:
+#ifdef CONFIG_ENC_ASSOC
+		if (ap_sta_is_epp(sta) &&
+		    wpa_auth_ap_sta_support_assoc_enc(sta->wpa_sm)) {
+			if ((rsne && assoc_rsne &&
+			     (rsne[1] != assoc_rsne[1] ||
+			      os_memcmp(rsne, assoc_rsne, 2 + rsne[1]) != 0))) {
+				size_t rsn_ie_len;
+
+				rsn_ie_len = 2 + rsne[1];
+				if ((size_t) (buf + buflen - p) >= rsn_ie_len) {
+					os_memcpy(p, rsne, rsn_ie_len);
+					p += rsn_ie_len;
+				}
+			}
+		}
+#endif /* CONFIG_ENC_ASSOC */
+		if (ie_count) {
+			*p++ = WLAN_EID_EXTENSION;
+			*p++ = 2 + ie_count + 1;
+			*p++ = WLAN_EID_EXT_NON_INHERITANCE;
+			*p++ = ie_count;
+			os_memcpy(p, non_inherit_ie, ie_count);
+			p += ie_count;
+			*p++ = 0; /* No Element ID Extension List */
+		}
+	}
+
 #ifdef CONFIG_IEEE80211BN
 	if (hostapd_is_uhr_enabled(hapd)) {
 		p = hostapd_eid_uhr_capab(hapd, p, IEEE80211_MODE_AP);
@@ -6233,6 +6899,9 @@ void ieee80211_ml_build_assoc_resp(struct hostapd_data *hapd,
 
 	p = hostapd_eid_mbo(hapd, p, buf + buflen - p);
 	p = hostapd_eid_wmm(hapd, p);
+
+	if (sta)
+		p = hostapd_eid_wfa_capab(hapd, sta, p);
 
 	if (hapd->conf->assocresp_elements &&
 	    (size_t) (buf + buflen - p) >=
@@ -6369,7 +7038,7 @@ out:
 	link->status = status;
 
 	if (!offload && type != LINK_PARSE_RECONF)
-		ieee80211_ml_build_assoc_resp(hapd, link);
+		ieee80211_ml_build_assoc_resp(hapd, link, sta);
 
 	wpa_printf(MSG_DEBUG, "MLD: link: status=%u", status);
 	if (status != WLAN_STATUS_SUCCESS) {
@@ -6451,12 +7120,12 @@ int hostapd_process_assoc_ml_info(struct hostapd_data *hapd,
 
 			link->status = WLAN_STATUS_UNSPECIFIED_FAILURE;
 			if (!offload)
-				ieee80211_ml_build_assoc_resp(hapd, link);
+				ieee80211_ml_build_assoc_resp(hapd, link, sta);
 		} else if (tx_link_status != WLAN_STATUS_SUCCESS) {
 			/* TX link rejected the connection */
 			link->status = WLAN_STATUS_DENIED_TX_LINK_NOT_ACCEPTED;
 			if (!offload)
-				ieee80211_ml_build_assoc_resp(hapd, link);
+				ieee80211_ml_build_assoc_resp(hapd, link, sta);
 		} else {
 			if (ieee80211_ml_process_link(
 				    bss, sta, link, ies, ies_len,
@@ -6649,7 +7318,8 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
 		buflen += 150;
 #endif /* CONFIG_FILS */
 #ifdef CONFIG_OWE
-	if (sta && (hapd->conf->wpa_key_mgmt & WPA_KEY_MGMT_OWE))
+	if (sta &&
+	    ((hostapd_config_all_key_mgmt(hapd->conf)) & WPA_KEY_MGMT_OWE))
 		buflen += 150;
 #endif /* CONFIG_OWE */
 #ifdef CONFIG_DPP2
@@ -6662,8 +7332,11 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
 		buflen += 3 + sizeof(struct ieee80211_eht_operation);
 		if (hapd->iconf->punct_bitmap)
 			buflen += EHT_OPER_DISABLED_SUBCHAN_BITMAP_SIZE;
-		if (ap_sta_is_mld(hapd, sta))
+		if (ap_sta_is_mld(hapd, sta)) {
 			buflen += hostapd_eid_eht_ml_tid_to_link_map_len(hapd);
+			buflen += hostapd_eid_eht_basic_ml_len(hapd, sta,
+							       false, true);
+		}
 	}
 #endif /* CONFIG_IEEE80211BE */
 #ifdef CONFIG_IEEE80211BN
@@ -6672,6 +7345,9 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
 		buflen += 3 + IEEE80211_UHR_OPER_MAX_SIZE;
 	}
 #endif /* CONFIG_IEEE80211BN */
+
+	if (hapd->conf->security_profiles)
+		buflen += hostapd_security_profile_len(hapd);
 
 	buf = os_zalloc(buflen);
 	if (!buf) {
@@ -6742,10 +7418,7 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
 
 #ifdef CONFIG_OWE
 	if (sta && status_code == WLAN_STATUS_SUCCESS &&
-	    ((hapd->conf->wpa_key_mgmt |
-	      hapd->conf->rsn_override_key_mgmt |
-	      hapd->conf->rsn_override_key_mgmt_2) &
-	     WPA_KEY_MGMT_OWE))
+	    ((hostapd_config_all_key_mgmt(hapd->conf)) & WPA_KEY_MGMT_OWE))
 		p = wpa_auth_write_assoc_resp_owe(sta->wpa_sm, p,
 						  buf + buflen - p);
 #endif /* CONFIG_OWE */
@@ -6818,7 +7491,8 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
 	}
 #endif /* CONFIG_TESTING_OPTIONS */
 	if (!omit_rsnxe)
-		p = hostapd_eid_rsnxe(hapd, p, buf + buflen - p);
+		p = hostapd_eid_rsnxe(hapd, p, buf + buflen - p,
+				      hapd->conf->rsnxe_capab_mask);
 #ifdef CONFIG_TESTING_OPTIONS
 rsnxe_done:
 #endif /* CONFIG_TESTING_OPTIONS */
@@ -6842,8 +7516,7 @@ rsnxe_done:
 #endif /* CONFIG_IEEE80211BN */
 
 #ifdef CONFIG_OWE
-	if (((hapd->conf->wpa_key_mgmt | hapd->conf->rsn_override_key_mgmt |
-	      hapd->conf->rsn_override_key_mgmt_2) & WPA_KEY_MGMT_OWE) &&
+	if (((hostapd_config_all_key_mgmt(hapd->conf)) & WPA_KEY_MGMT_OWE) &&
 	    sta && sta->owe_ecdh && status_code == WLAN_STATUS_SUCCESS &&
 	    wpa_auth_sta_key_mgmt(sta->wpa_sm) == WPA_KEY_MGMT_OWE &&
 	    !wpa_auth_sta_get_pmksa(sta->wpa_sm)) {
@@ -6872,6 +7545,16 @@ rsnxe_done:
 	     sta->auth_alg == WLAN_AUTH_802_1X) &&
 	    wpa_auth_ap_sta_support_assoc_enc(sta->wpa_sm) &&
 	    status_code == WLAN_STATUS_SUCCESS) {
+		int left;
+
+		/* Ensure GMK/Counter are initialized before the Key Delivery
+		 * element is built. For auth-frame STAs the normal 4-way
+		 * handshake path (SM_STATE AUTHENTICATION2) is skipped, so
+		 * wpa_group_ensure_init() must be called here instead.
+		 * Without this, the first non-auth-frame STA that connects
+		 * later triggers a GTK rotation that is unknown to this STA,
+		 * breaking broadcast frame reception. */
+		wpa_auth_ensure_group_init(sta->wpa_sm);
 		reply->frame_control |= WLAN_FC_PROTECTED;
 
 #ifdef CONFIG_PMKSA_PRIVACY
@@ -6941,9 +7624,18 @@ rsnxe_done:
 #endif /* CONFIG_SAE */
 #endif /* CONFIG_PMKSA_PRIVACY */
 
-		p = wpa_auth_write_assoc_resp_eppke(sta->wpa_sm, p,
-						    buf + buflen - p,
+		left = buf + buflen - p - hostapd_security_profile_len(hapd);
+		if (left <= 0) {
+			wpa_printf(MSG_ERROR,
+				   "EPP: No room for EPPKE/security profile in assoc resp");
+			goto no_room;
+		}
+		p = wpa_auth_write_assoc_resp_eppke(sta->wpa_sm, p, left,
 						    ap_sta_is_mld(hapd, sta));
+
+		if (hapd->conf->security_profiles)
+			p = hostapd_eid_security_profile(hapd, p);
+	no_room:
 	}
 #endif /* CONFIG_ENC_ASSOC */
 
@@ -7012,6 +7704,7 @@ rsnxe_done:
 #endif /* CONFIG_P2P_MANAGER */
 
 	p = hostapd_eid_mbo(hapd, p, buf + buflen - p);
+	p = hostapd_eid_wfa_capab(hapd, sta, p);
 
 	if (hapd->conf->assocresp_elements &&
 	    (size_t) (buf + buflen - p) >=
@@ -7234,6 +7927,7 @@ static void handle_assoc(struct hostapd_data *hapd,
 	int omit_rsnxe = 0;
 	bool set_beacon = false;
 	bool mld_addrs_not_translated = false;
+	bool epp_sta = false;
 
 	if (len < IEEE80211_HDRLEN + (reassoc ? sizeof(mgmt->u.reassoc_req) :
 				      sizeof(mgmt->u.assoc_req))) {
@@ -7398,6 +8092,10 @@ static void handle_assoc(struct hostapd_data *hapd,
 			return;
 		}
 	}
+
+#ifdef CONFIG_ENC_ASSOC
+	epp_sta = sta->epp_sta;
+#endif /* CONFIG_ENC_ASSOC */
 
 	if ((fc & WLAN_FC_RETRY) &&
 	    sta->last_seq_ctrl != WLAN_INVALID_MGMT_SEQ &&
@@ -7680,11 +8378,16 @@ static void handle_assoc(struct hostapd_data *hapd,
 
 	/*
 	 * Remove the station in case transmission of a success response fails
-	 * (the STA was added associated to the driver) or if the station was
-	 * previously added unassociated.
+	 * (the STA was added associated to the driver) or if a non-EPP station
+	 * was previously added unassociated. For an EPP non-AP STA, defer the
+	 * cleanup until reception of a (Re)Association Response frame TX
+	 * callback to ensure that the STA context and its associated pairwise
+	 * keys are available until transmission of the encrypted
+	 * (Re)Association Response frame carrying a failure status is complete.
 	 */
 	if (sta && ((reply_res != WLAN_STATUS_SUCCESS &&
-		     resp == WLAN_STATUS_SUCCESS) || sta->added_unassoc)) {
+		     resp == WLAN_STATUS_SUCCESS) ||
+		    (sta->added_unassoc && !epp_sta))) {
 		hostapd_drv_sta_remove(hapd, sta->addr);
 		sta->added_unassoc = 0;
 	}
@@ -7900,6 +8603,36 @@ static void handle_beacon(struct hostapd_data *hapd,
 }
 
 
+#ifdef CONFIG_ROBUST_AV
+static void hostapd_dscp_action(struct hostapd_data *hapd, struct sta_info *sta,
+				const u8 *pos, const u8 *end)
+{
+	u8 subtype;
+
+	if (!hapd->conf->enable_dscp_policy_capa)
+		return;
+
+	if (end - pos < 1) {
+		wpa_printf(MSG_DEBUG, "DSCP Action: Frame too short");
+		return;
+	}
+
+	subtype = *pos++;
+	switch (subtype) {
+	case QM_DSCP_POLICY_QUERY:
+		hostapd_handle_dscp_policy_query(hapd, sta, pos, end - pos);
+		break;
+	case QM_DSCP_POLICY_RESP:
+		hostapd_handle_dscp_policy_response(hapd, sta, pos, end - pos);
+		break;
+	default:
+		wpa_printf(MSG_DEBUG, "QM Action: Unknown subtype %u", subtype);
+		break;
+	}
+}
+#endif /* CONFIG_ROBUST_AV */
+
+
 static int hostapd_action_vs(struct hostapd_data *hapd,
 			     struct sta_info *sta,
 			     const struct ieee80211_mgmt *mgmt, size_t len,
@@ -7922,6 +8655,16 @@ static int hostapd_action_vs(struct hostapd_data *hapd,
 	case WFA_CAPAB_VENDOR_TYPE:
 		hostapd_wfa_capab(hapd, sta, pos, end);
 		return 0;
+#ifdef CONFIG_ROBUST_AV
+	case QM_ACTION_VENDOR_TYPE:
+		if (!protected) {
+			wpa_printf(MSG_DEBUG,
+				   "DSCP: Ignoring unprotected frame");
+			return -1;
+		}
+		hostapd_dscp_action(hapd, sta, pos, end);
+		return 0;
+#endif /* CONFIG_ROBUST_AV */
 	default:
 		wpa_printf(MSG_DEBUG,
 			   "Ignore unknown Vendor Specific Action frame OUI/type %08x%s",
@@ -8079,7 +8822,7 @@ static int handle_action(struct hostapd_data *hapd,
 #endif /* CONFIG_DPP */
 #ifdef CONFIG_NAN_USD
 		if (mgmt->u.action.category == WLAN_ACTION_PUBLIC &&
-		    len >= IEEE80211_HDRLEN + 5 &&
+		    len >= IEEE80211_HDRLEN + 6 &&
 		    mgmt->u.action.u.vs_public_action.action ==
 		    WLAN_PA_VENDOR_SPECIFIC &&
 		    WPA_GET_BE24(mgmt->u.action.u.vs_public_action.oui) ==
@@ -8506,6 +9249,7 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
 	u16 status;
 	struct sta_info *sta;
 	int new_assoc = 1;
+	bool epp_sta = false;
 
 	sta = ap_get_sta(hapd, mgmt->da);
 	if (!sta) {
@@ -8513,6 +9257,10 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
 			   MAC2STR(mgmt->da));
 		return;
 	}
+
+#ifdef CONFIG_ENC_ASSOC
+	epp_sta = sta->epp_sta;
+#endif /* CONFIG_ENC_ASSOC */
 
 #ifdef CONFIG_IEEE80211BE
 	if (ap_sta_is_mld(hapd, sta) &&
@@ -8544,15 +9292,26 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
 			       HOSTAPD_LEVEL_DEBUG,
 			       "did not acknowledge association response");
 		sta->flags &= ~WLAN_STA_ASSOC_REQ_OK;
-		/* The STA is added only in case of SUCCESS */
-		if (status == WLAN_STATUS_SUCCESS)
+		/*
+		 * A non-EPP STA is added to the driver only for a successful
+		 * association. For EPP stations, the driver may retain the STA
+		 * context even for association failures until the
+		 * (Re)Association Response frame TX callback is received.
+		 * Remove the driver STA entry once the callback is received
+		 */
+		if (status == WLAN_STATUS_SUCCESS || epp_sta)
 			hostapd_drv_sta_remove(hapd, sta->addr);
 
 		goto handle_ml;
 	}
 
-	if (status != WLAN_STATUS_SUCCESS)
+	if (status != WLAN_STATUS_SUCCESS) {
+		if (epp_sta) {
+			hostapd_drv_sta_remove(hapd, sta->addr);
+			sta->added_unassoc = 0;
+		}
 		goto handle_ml;
+	}
 
 	/* Stop previous accounting session, if one is started, and allocate
 	 * new session id for the new session. */
@@ -8689,6 +9448,16 @@ skip_update:
 			   MAC2STR(sta->addr));
 		sta->pending_wds_enable = 0;
 		sta->flags |= WLAN_STA_WDS;
+#ifdef CONFIG_IEEE80211BE
+		if (hapd->conf->mld_ap &&
+		    hostapd_get_wds_mld_ifname_id(hapd, sta) < 0) {
+			wpa_printf(MSG_DEBUG,
+				   "No room for WDS ifname_id to enable 4-address WDS mode for STA "
+				   MACSTR, MAC2STR(sta->addr));
+			sta->flags &= ~WLAN_STA_WDS;
+			return;
+		}
+#endif /* CONFIG_IEEE80211BE */
 	}
 
 	/* WPS not supported on backhaul BSS. Disable 4addr mode on fronthaul */
@@ -8699,12 +9468,18 @@ skip_update:
 	     !(sta->flags & WLAN_STA_WPS))) {
 		int ret;
 		char ifname_wds[IFNAMSIZ + 1];
+		int ifname_id = sta->aid;
+
+#ifdef CONFIG_IEEE80211BE
+		if (hapd->conf->mld_ap && (sta->flags & WLAN_STA_WDS))
+			ifname_id = sta->wds_ifname_id;
+#endif /* CONFIG_IEEE80211BE */
 
 		wpa_printf(MSG_DEBUG, "Reenable 4-address WDS mode for STA "
-			   MACSTR " (aid %u)",
-			   MAC2STR(sta->addr), sta->aid);
+			   MACSTR " (ifname_id %u)",
+			   MAC2STR(sta->addr), ifname_id);
 		ret = hostapd_set_wds_sta(hapd, ifname_wds, sta->addr,
-					  sta->aid, 1);
+					  ifname_id, 1);
 		if (!ret)
 			hostapd_set_wds_encryption(hapd, sta, ifname_wds);
 	}
@@ -8747,6 +9522,27 @@ skip_update:
 		os_free(sta->pending_eapol_rx);
 		sta->pending_eapol_rx = NULL;
 	}
+
+#ifdef CONFIG_ROBUST_AV
+	if (hapd->conf->enable_dscp_policy_capa && sta &&
+	    (sta->flags & WLAN_STA_DSCP_POLICY) && sta->num_dscp_policies > 0) {
+		int *policy_ids = NULL;
+		size_t num_policies = 0;
+		unsigned int i;
+
+		policy_ids = os_calloc(sta->num_dscp_policies, sizeof(int));
+		if (!policy_ids)
+			return;
+
+		for (i = 0; i < sta->num_dscp_policies; i++)
+			policy_ids[num_policies++] =
+				sta->policies[i]->policy_id;
+
+		hostapd_send_unsolicited_dscp_policy_request(
+			hapd, sta, 0, policy_ids, num_policies);
+		os_free(policy_ids);
+	}
+#endif /* CONFIG_ROBUST_AV */
 
 handle_ml:
 	hostapd_ml_handle_assoc_cb(hapd, sta, ok);
@@ -9046,8 +9842,22 @@ void ieee802_11_rx_from_unknown(struct hostapd_data *hapd, const u8 *src,
 	if (sta &&
 	    ((sta->flags & WLAN_STA_ASSOC) ||
 	     ((sta->flags & WLAN_STA_ASSOC_REQ_OK) && wds))) {
+		int ifname_id = sta->aid;
+
 		if (!hapd->conf->wds_sta)
 			return;
+
+#ifdef CONFIG_IEEE80211BE
+		if (hapd->conf->mld_ap && wds) {
+			if (hostapd_get_wds_mld_ifname_id(hapd, sta) < 0) {
+				wpa_printf(MSG_DEBUG,
+					   "No room for WDS ifname_id to enable 4-address WDS mode for STA "
+					   MACSTR, MAC2STR(sta->addr));
+				return;
+			}
+			ifname_id = sta->wds_ifname_id;
+		}
+#endif /* CONFIG_IEEE80211BE */
 
 		if ((sta->flags & (WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK)) ==
 		    WLAN_STA_ASSOC_REQ_OK) {
@@ -9064,11 +9874,11 @@ void ieee802_11_rx_from_unknown(struct hostapd_data *hapd, const u8 *src,
 			char ifname_wds[IFNAMSIZ + 1];
 
 			wpa_printf(MSG_DEBUG, "Enable 4-address WDS mode for "
-				   "STA " MACSTR " (aid %u)",
-				   MAC2STR(sta->addr), sta->aid);
+				   "STA " MACSTR " (ifname_id %u)",
+				   MAC2STR(sta->addr), ifname_id);
 			sta->flags |= WLAN_STA_WDS;
 			ret = hostapd_set_wds_sta(hapd, ifname_wds,
-						  sta->addr, sta->aid, 1);
+						  sta->addr, ifname_id, 1);
 			if (!ret)
 				hostapd_set_wds_encryption(hapd, sta,
 							   ifname_wds);
@@ -9172,42 +9982,59 @@ u8 * hostapd_eid_txpower_envelope(struct hostapd_data *hapd, u8 *eid)
 	 */
 	if (is_6ghz_op_class(iconf->op_class)) {
 		enum max_tx_pwr_interpretation tx_pwr_intrpn;
+		int err;
+		int max_eirp_psd = REG_PSD_MAX_TXPOWER_FOR_DEFAULT_CLIENT * 2;
+		int max_eirp_power = iconf->reg_def_cli_eirp;
 
 		/* Same Maximum Transmit Power for all 20 MHz bands */
 		tx_pwr_count = 0;
 		tx_pwr_intrpn = REGULATORY_CLIENT_EIRP_PSD;
 
 		/* Default Transmit Power Envelope for Global Operating Class */
-		if (hapd->iconf->reg_def_cli_eirp_psd != -1)
-			tx_pwr = hapd->iconf->reg_def_cli_eirp_psd;
-		else
-			tx_pwr = REG_PSD_MAX_TXPOWER_FOR_DEFAULT_CLIENT * 2;
+		err = hostap_afc_get_chan_max_eirp_power(iface, true,
+							 &max_eirp_psd);
+		if (err < 0) {
+			if (hapd->iconf->reg_def_cli_eirp_psd != -1)
+				max_eirp_psd =
+					hapd->iconf->reg_def_cli_eirp_psd;
+			else
+				max_eirp_psd =
+					REG_PSD_MAX_TXPOWER_FOR_DEFAULT_CLIENT * 2;
+		}
 
 		eid = hostapd_add_tpe_info(eid, tx_pwr_count, tx_pwr_intrpn,
-					   REG_DEFAULT_CLIENT, tx_pwr);
+					   REG_DEFAULT_CLIENT, max_eirp_psd);
 
 		/* Indoor Access Point must include an additional TPE for
 		 * subordinate devices */
 		if (he_reg_is_indoor(iconf->he_6ghz_reg_pwr_type)) {
-			/* TODO: Extract PSD limits from channel data */
-			if (hapd->iconf->reg_sub_cli_eirp_psd != -1)
-				tx_pwr = hapd->iconf->reg_sub_cli_eirp_psd;
-			else
-				tx_pwr = REG_PSD_MAX_TXPOWER_FOR_SUBORDINATE_CLIENT * 2;
+			if (err < 0) {
+				/* non-AFC connection */
+				if (hapd->iconf->reg_sub_cli_eirp_psd != -1)
+					max_eirp_psd =
+						hapd->iconf->reg_sub_cli_eirp_psd;
+				else
+					max_eirp_psd =
+						REG_PSD_MAX_TXPOWER_FOR_SUBORDINATE_CLIENT * 2;
+			}
 			eid = hostapd_add_tpe_info(eid, tx_pwr_count,
 						   tx_pwr_intrpn,
 						   REG_SUBORDINATE_CLIENT,
-						   tx_pwr);
+						   max_eirp_psd);
 		}
 
-		if (iconf->reg_def_cli_eirp != -1 &&
-		    he_reg_is_sp(iconf->he_6ghz_reg_pwr_type))
-			eid = hostapd_add_tpe_info(
-				eid, tx_pwr_count, REGULATORY_CLIENT_EIRP,
-				REG_DEFAULT_CLIENT,
-				hapd->iconf->reg_def_cli_eirp);
+		if (hostap_afc_get_chan_max_eirp_power(iface, false,
+						       &max_eirp_power)) {
+			max_eirp_power = iconf->reg_def_cli_eirp;
+			if (max_eirp_power == -1 ||
+			    !he_reg_is_sp(iconf->he_6ghz_reg_pwr_type))
+				return eid;
+		}
 
-		return eid;
+		return hostapd_add_tpe_info(eid, tx_pwr_count,
+					    REGULATORY_CLIENT_EIRP,
+					    REG_DEFAULT_CLIENT,
+					    max_eirp_power);
 	}
 #endif /* CONFIG_IEEE80211AX */
 
@@ -9607,6 +10434,9 @@ static bool hostapd_rnr_get_bss_info(struct hostapd_data *hapd,
 	struct hostapd_data *bss;
 	bool ap_mld = false;
 	u8 tmp_match_idx = 255;
+	enum oper_chan_width bss_chwidth;
+	int secondary_channel;
+	u8 seg0, seg1;
 
 	if (!hapd->iface || i >= hapd->iface->num_bss || !op_class || !channel)
 		return false;
@@ -9631,10 +10461,16 @@ static bool hostapd_rnr_get_bss_info(struct hostapd_data *hapd,
 			     mld_update, reporting_hapd, bss, match_idx))
 		return false;
 
+	hostapd_get_oper_chan_info_of_bss(bss, &bss_chwidth, &seg0, &seg1);
+	secondary_channel = bss->iconf->secondary_channel;
+
+	if (seg0 == bss->iconf->channel &&
+	    bss_chwidth == CONF_OPER_CHWIDTH_USE_HT)
+		secondary_channel = 0;
+
 	if (ieee80211_freq_to_channel_ext(
 		    bss->iface->freq,
-		    bss->iconf->secondary_channel,
-		    hostapd_get_oper_chan_width_of_bss(bss),
+		    secondary_channel, bss_chwidth,
 		    op_class, channel) == NUM_HOSTAPD_MODES)
 		return false;
 

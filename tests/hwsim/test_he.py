@@ -116,6 +116,23 @@ def test_he_spr_params(dev, apdev):
         raise Exception("STATUS did not indicate ieee80211ax=1")
     dev[0].connect("he", key_mgmt="NONE", scan_freq="2412")
 
+def test_he_spr_zero_offsets(dev, apdev):
+    """HE AP spatial reuse parameters with zero offsets"""
+    params = {"ssid": "he-zero-offsets",
+              "ieee80211ax": "1",
+              "he_spr_sr_control": "12",
+              "he_spr_non_srg_obss_pd_max_offset": "0",
+              "he_spr_srg_obss_pd_min_offset": "0",
+              "he_spr_srg_obss_pd_max_offset": "0",
+              "he_spr_srg_bss_colors": "1 2 10 63",
+              "he_spr_srg_partial_bssid": "0 1 3 63",
+              "he_oper_chwidth": "0",
+              "he_oper_centr_freq_seg0_idx": "1",
+              "he_oper_centr_freq_seg1_idx": "0"}
+    hapd = hostapd.add_ap(apdev[0], params)
+    if hapd.get_status_field("ieee80211ax") != "1":
+        raise Exception("STATUS did not indicate ieee80211ax=1")
+
 def he_supported():
     cmd = subprocess.Popen(["iw", "reg", "get"], stdout=subprocess.PIPE)
     out, err = cmd.communicate()

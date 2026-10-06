@@ -74,11 +74,40 @@ int nan_parse_attrs(struct nan_data *nan, const u8 *data, size_t len,
 
 	while (end - pos > 3) {
 		u8 id = *pos++;
-		u16 attr_len = WPA_GET_LE16(pos);
+		u16 attr_len;
 
+		/*
+		 * IEEE 802.11 MME (Element ID 0x4C = 76) uses the standard
+		 * element format: [ID:1][Length:1][payload:Length].
+		 * NAN attributes use [ID:1][Length:2-LE][payload:Length].
+		 * An MME is added after the NAN attributes in group-addressed
+		 * SDF/NAF frames when management frame protection is used.
+		 * The MME might not be removed from the frame (e.g., if an IGTK
+		 * is not installed), so parse it with the correct 1-byte length
+		 * field and skip it so the LE16 NAN length reader does not
+		 * misinterpret the element length + next byte as a large value.
+		 */
+		if (id == 0x4C) {
+			u8 elem_len;
+
+			if (end - pos < 1)
+				break;
+			elem_len = *pos;
+			wpa_printf(MSG_DEBUG,
+				   "NAN: Skipping 802.11 MME (0x4C) len=%u",
+				   elem_len);
+			pos += 1 + elem_len;
+			continue;
+		}
+
+		attr_len = WPA_GET_LE16(pos);
 		pos += 2;
-		if (attr_len > end - pos)
-			goto fail;
+		if (attr_len > end - pos) {
+			wpa_printf(MSG_DEBUG,
+				   "NAN: Truncated attribute %u (len %u; left %zu), skipping",
+				   id, attr_len, end - pos);
+			break;
+		}
 
 		switch (id) {
 		case NAN_ATTR_SDEA:
@@ -243,11 +272,57 @@ int nan_parse_attrs(struct nan_data *nan, const u8 *data, size_t len,
 			attrs->ndpe = pos;
 			attrs->ndpe_len = attr_len;
 			break;
+		case NAN_ATTR_PBEA:
+			/* Validate minimal PBEA length: control (1) */
+			if (attr_len < 1)
+				break;
+			attrs->pbea = pos;
+			attrs->pbea_len = attr_len;
+			break;
+		case NAN_ATTR_IRSA:
+			if (attr_len < 1 ||
+			    pos[0] != NAN_IRSA_CIPHER_VER_SIPHASH_2_4)
+				break;
+
+			/*
+			 * Cipher Version (1) + Nonce (8) + Tag (1 * 8) minimum.
+			 * Tag length is not fixed here as it can contain
+			 * multiple tags.
+			 */
+			if (attr_len <
+			    1 + NAN_NIRA_NONCE_LEN + NAN_NIRA_TAG_LEN)
+				break;
+
+			attrs->irsa = pos;
+			attrs->irsa_len = attr_len;
+			break;
+		case NAN_ATTR_RSIA:
+			/*
+			 * Requestor Instance ID (1) + RSID Control (1) +
+			 * RSID Number (1) + RSID List (RSID Number * 6).
+			 * Minimum RSID List length is 0?
+			 * Assuming at least 1+1+1 = 3 bytes.
+			 */
+			if (attr_len < 3)
+				break;
+
+			attrs->rsia = pos;
+			attrs->rsia_len = attr_len;
+			break;
+		case NAN_ATTR_CONN_CAPA:
+			if (attr_len < 2)
+				break;
+
+			attrs->conn_capa = WPA_GET_LE16(pos);
+			attrs->conn_capa_valid = true;
+			wpa_printf(MSG_DEBUG,
+				   "NAN: Parsed connection capability: 0x%04x",
+				   attrs->conn_capa);
+			break;
 		case NAN_ATTR_MASTER_INDICATION:
 		case NAN_ATTR_CLUSTER:
 		case NAN_ATTR_NAN_ATTR_SERVICE_ID_LIST:
 		case NAN_ATTR_SDA:
-		case NAN_ATTR_CONN_CAPA:
 		case NAN_ATTR_WLAN_INFRA:
 		case NAN_ATTR_P2P_OPER:
 		case NAN_ATTR_IBSS:
@@ -358,6 +433,15 @@ int nan_parse_naf(struct nan_data *nan, const struct ieee80211_mgmt *mgmt,
 			       mgmt->u.action.u.naf.variable,
 			       len - IEEE80211_MIN_ACTION_LEN(naf),
 			       &msg->attrs);
+}
+
+
+/* Add NAN Connection Capability attribute (Wi-Fi Aware R5 spec, Table 78) */
+void nan_add_conn_capa_attr(struct wpabuf *buf, u16 capa_bitmap)
+{
+	wpabuf_put_u8(buf, NAN_ATTR_CONN_CAPA);
+	wpabuf_put_le16(buf, 2);
+	wpabuf_put_le16(buf, capa_bitmap);
 }
 
 
@@ -897,7 +981,8 @@ int nan_add_avail_attrs(struct nan_data *nan, u8 sequence_id,
 		if (chan->conditional.len)
 			nan_add_avail_entry(nan, &chan->conditional,
 					    type_for_conditional,
-					    op_class, chan_bm, 0, buf);
+					    op_class, chan_bm, pri_chan_bm,
+					    buf);
 	}
 
 	if (last_map_id != NAN_INVALID_MAP_ID) {
@@ -1776,7 +1861,7 @@ err:
  * @nan: Pointer to NAN data struct
  * @peer_sched: Pointer to peer schedule struct
  * @map_idx: Index of the availability map to check
- * Returns: Frequency of the committed channel that intersects with NDC,
+ * Returns: Frequency of the peer channel that intersects with NDC,
  *          or -1 on failure or if no intersection found
  *
  * In case NDC bitmap spans across multiple channels, only one channel is
@@ -1801,28 +1886,29 @@ int nan_get_peer_ndc_freq(struct nan_data *nan,
 		return -1;
 
 	for (i = 0; i < peer_sched->maps[map_idx].n_chans; i++) {
-		struct bitfield *committed_bf;
+		struct bitfield *peer_chan_map;
 
-		if (!peer_sched->maps[map_idx].chans[i].committed)
-			continue;
-
-		committed_bf =
+		/*
+		 * Check all peer channel entries (committed or conditional).
+		 * Potential entries are not part of the peer schedule.
+		 */
+		peer_chan_map =
 			nan_tbm_to_bf(nan,
 				      &peer_sched->maps[map_idx].chans[i].tbm);
-		if (!committed_bf) {
+		if (!peer_chan_map) {
 			wpa_printf(MSG_DEBUG,
-				   "NAN: Failed to convert peer committed TBM to bitfield");
+				   "NAN: Failed to convert peer channel TBM to bitfield");
 			bitfield_free(ndc_bf);
 			return -1;
 		}
 
-		if (bitfield_intersects(ndc_bf, committed_bf)) {
+		if (bitfield_intersects(ndc_bf, peer_chan_map)) {
 			bitfield_free(ndc_bf);
-			bitfield_free(committed_bf);
+			bitfield_free(peer_chan_map);
 			return peer_sched->maps[map_idx].chans[i].chan.freq;
 		}
 
-		bitfield_free(committed_bf);
+		bitfield_free(peer_chan_map);
 	}
 
 	bitfield_free(ndc_bf);

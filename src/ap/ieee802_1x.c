@@ -1392,6 +1392,9 @@ void ieee802_1x_new_station(struct hostapd_data *hapd, struct sta_info *sta)
 	key_mgmt = wpa_auth_sta_key_mgmt(sta->wpa_sm);
 	if (key_mgmt != -1 &&
 	    (wpa_key_mgmt_wpa_psk(key_mgmt) || key_mgmt == WPA_KEY_MGMT_OWE ||
+#ifdef CONFIG_ENC_ASSOC
+	     key_mgmt == WPA_KEY_MGMT_EPPKE ||
+#endif /* CONFIG_ENC_ASSOC */
 	     key_mgmt == WPA_KEY_MGMT_DPP)) {
 		wpa_printf(MSG_DEBUG, "IEEE 802.1X: Ignore STA - using PSK");
 		/*
@@ -3002,7 +3005,11 @@ int ieee802_1x_get_mib_sta(struct hostapd_data *hapd, struct sta_info *sta,
 		id = eap_get_identity(sm->eap, &id_len);
 		if (id)
 			identity_buf = dup_binstr(id, id_len);
+	} else if (sm->eap && sm->identity) {
+		identity_buf = dup_binstr(sm->identity,
+					  sm->identity_len);
 	}
+
 	ret = os_snprintf(buf + len, buflen - len,
 			  /* TODO: dot1xAuthSessionOctetsRx */
 			  /* TODO: dot1xAuthSessionOctetsTx */
@@ -3018,8 +3025,7 @@ int ieee802_1x_get_mib_sta(struct hostapd_data *hapd, struct sta_info *sta,
 				   wpa_auth_sta_key_mgmt(sta->wpa_sm))) ?
 			  1 : 2,
 			  (unsigned int) diff.sec,
-			  sm->identity ? (char *) sm->identity :
-					 (identity_buf ? identity_buf : "N/A"));
+			  identity_buf ? identity_buf : "N/A");
 	os_free(identity_buf);
 	if (os_snprintf_error(buflen - len, ret))
 		return len;

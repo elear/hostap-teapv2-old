@@ -34,6 +34,7 @@
 #include "dfs.h"
 #include "taxonomy.h"
 #include "ieee802_11_auth.h"
+#include "robust_av.h"
 
 
 #ifdef NEED_AP_MLME
@@ -481,6 +482,25 @@ static size_t hostapd_get_rsnxe_override_len(struct hostapd_data *hapd)
 }
 
 
+u8 * hostapd_get_rsn_override_elems(struct hostapd_data *hapd, u8 *pos,
+				    size_t len)
+{
+	u8 *end = pos + len;
+
+	pos = hostapd_get_rsne_override(hapd, pos, end - pos);
+	pos = hostapd_get_rsne_override_2(hapd, pos, end - pos);
+	return hostapd_get_rsnxe_override(hapd, pos, end - pos);
+}
+
+
+size_t hostapd_get_rsn_override_elems_len(struct hostapd_data *hapd)
+{
+	return hostapd_get_rsne_override_len(hapd) +
+		hostapd_get_rsne_override_2_len(hapd) +
+		hostapd_get_rsnxe_override_len(hapd);
+}
+
+
 static u8 * hostapd_eid_csa(struct hostapd_data *hapd, u8 *eid)
 {
 #ifdef CONFIG_TESTING_OPTIONS
@@ -555,14 +575,22 @@ static u8 * hostapd_eid_supported_op_classes(struct hostapd_data *hapd, u8 *eid)
 {
 	u8 op_class, channel;
 	enum oper_chan_width chwidth;
+	int secondary_channel;
+	u8 seg0, seg1;
 
 	if (!(hapd->iface->drv_flags & WPA_DRIVER_FLAGS_AP_CSA) ||
 	    !hapd->iface->freq)
 		return eid;
 
-	chwidth = hostapd_get_oper_chan_width_of_bss(hapd);
+	hostapd_get_oper_chan_info_of_bss(hapd, &chwidth, &seg0, &seg1);
+	secondary_channel = hapd->iconf->secondary_channel;
+
+	if (seg0 == hapd->iconf->channel &&
+	    chwidth == CONF_OPER_CHWIDTH_USE_HT)
+		secondary_channel = 0;
+
 	if (ieee80211_freq_to_channel_ext(hapd->iface->freq,
-					  hapd->iconf->secondary_channel,
+					  secondary_channel,
 					  chwidth,
 					  &op_class, &channel) ==
 	    NUM_HOSTAPD_MODES)
@@ -828,6 +856,7 @@ static size_t hostapd_probe_resp_elems_len(struct hostapd_data *hapd,
 	buflen += hostapd_get_rsne_override_len(hapd);
 	buflen += hostapd_get_rsne_override_2_len(hapd);
 	buflen += hostapd_get_rsnxe_override_len(hapd);
+	buflen += hostapd_eid_wfa_capab_len(hapd);
 
 	return buflen;
 }
@@ -995,6 +1024,7 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
 		pos = hostapd_eid_uhr_operation(hapd, pos, false);
 	}
 #endif /* CONFIG_IEEE80211BN */
+	pos = hostapd_eid_security_profile(hapd, pos);
 
 #ifdef CONFIG_IEEE80211AC
 	if (hapd->conf->vendor_vht)
@@ -1040,6 +1070,8 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
 	pos = hostapd_get_rsne_override(hapd, pos, epos - pos);
 	pos = hostapd_get_rsne_override_2(hapd, pos, epos - pos);
 	pos = hostapd_get_rsnxe_override(hapd, pos, epos - pos);
+
+	pos = hostapd_eid_wfa_capab(hapd, NULL, pos);
 
 	if (hapd->conf->vendor_elements) {
 		os_memcpy(pos, wpabuf_head(hapd->conf->vendor_elements),
@@ -2326,6 +2358,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
 	if (hostapd_is_uhr_enabled(hapd))
 		tail_len += 3 + sizeof(struct ieee80211_uhr_operation);
 #endif /* CONFIG_IEEE80211BN */
+	tail_len += hostapd_security_profile_len(hapd);
 
 	tail_len += hostapd_mbo_ie_len(hapd);
 	tail_len += hostapd_eid_owe_trans_len(hapd);
@@ -2333,6 +2366,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
 	tail_len += hostapd_get_rsne_override_len(hapd);
 	tail_len += hostapd_get_rsne_override_2_len(hapd);
 	tail_len += hostapd_get_rsnxe_override_len(hapd);
+	tail_len += hostapd_eid_wfa_capab_len(hapd);
 
 	tailpos = tail = os_malloc(tail_len);
 	if (head == NULL || tail == NULL) {
@@ -2527,6 +2561,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
 		}
 	}
 #endif /* CONFIG_IEEE80211BN */
+	tailpos = hostapd_eid_security_profile(hapd, tailpos);
 
 #ifdef CONFIG_IEEE80211AC
 	if (hapd->conf->vendor_vht)
@@ -2575,6 +2610,8 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
 					      tail + tail_len - tailpos);
 	tailpos = hostapd_get_rsnxe_override(hapd, tailpos,
 					     tail + tail_len - tailpos);
+
+	tailpos = hostapd_eid_wfa_capab(hapd, NULL, tailpos);
 
 	if (hapd->conf->vendor_elements) {
 		os_memcpy(tailpos, wpabuf_head(hapd->conf->vendor_elements),

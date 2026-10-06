@@ -24,6 +24,12 @@ ifdef CONFIG_BUILD_WPA_CLIENT_SO
 _all: libwpa_client.so
 endif
 
+ifdef CONFIG_BUILD_WPA_CLIENT_STATIC
+# add the dependency this way to allow CONFIG_BUILD_WPA_CLIENT_STATIC
+# being set in the config which is read by build.rules
+_all: libwpa_client.a
+endif
+
 ifndef CONFIG_NO_WPA_PASSPHRASE
 # add the dependency this way to allow CONFIG_NO_WPA_PASSPHRASE
 # being set in the config which is read by build.rules
@@ -90,6 +96,10 @@ endif
 
 ifdef CONFIG_BUILD_WPA_CLIENT_SO
 	install -m 0644 -D libwpa_client.so $(DESTDIR)/$(LIBDIR)/libwpa_client.so
+	install -m 0644 -D ../src/common/wpa_ctrl.h $(DESTDIR)/$(INCDIR)/wpa_ctrl.h
+endif
+ifdef CONFIG_BUILD_WPA_CLIENT_STATIC
+	install -m 0644 -D libwpa_client.a $(DESTDIR)/$(LIBDIR)/libwpa_client.a
 	install -m 0644 -D ../src/common/wpa_ctrl.h $(DESTDIR)/$(INCDIR)/wpa_ctrl.h
 endif
 	if ls eap_*.so >/dev/null 2>&1; then \
@@ -449,6 +459,18 @@ ifdef CONFIG_WIFI_DISPLAY
 CFLAGS += -DCONFIG_WIFI_DISPLAY
 OBJS += wifi_display.o
 endif
+endif
+
+ifdef CONFIG_PQC
+CONFIG_IEEE8021X_AUTH=y
+CONFIG_PMKSA_PRIVACY=y
+CONFIG_ENC_ASSOC=y
+CFLAGS += -DCONFIG_PQC
+NEED_HMAC_SHA384_KDF=y
+NEED_HMAC_SHA512_KDF=y
+NEED_SHA384=y
+NEED_SHA512=y
+NEED_OPENSSL_3_5=y
 endif
 
 ifdef CONFIG_PMKSA_PRIVACY
@@ -1098,6 +1120,10 @@ endif
 ifdef CONFIG_CTRL_IFACE
 OBJS += ../src/ap/ctrl_iface_ap.o
 endif
+ifdef CONFIG_ROBUST_AV
+CFLAGS += -DCONFIG_ROBUST_AV
+OBJS += ../src/ap/robust_av.o
+endif
 
 CFLAGS += -DEAP_SERVER -DEAP_SERVER_IDENTITY
 OBJS += ../src/eap_server/eap_server.o
@@ -1277,6 +1303,16 @@ endif
 
 ifeq ($(CONFIG_TLS), openssl)
 CFLAGS += -DCRYPTO_RSA_OAEP_SHA256
+ifdef NEED_OPENSSL_3_5
+ifneq ($(OPENSSL_PREFIX),)
+CFLAGS += -I$(OPENSSL_PREFIX)/include
+LDFLAGS += -L$(OPENSSL_PREFIX)/lib -Wl,-rpath,$(OPENSSL_PREFIX)/lib
+else
+ifeq ($(shell pkg-config --atleast-version=3.5 openssl 2>/dev/null && echo yes),)
+$(error CONFIG_PQC requires OpenSSL >= 3.5; set OPENSSL_PREFIX or install OpenSSL 3.5)
+endif
+endif
+endif
 ifdef TLS_FUNCS
 CFLAGS += -DEAP_TLS_OPENSSL
 OBJS += ../src/crypto/tls_openssl.o

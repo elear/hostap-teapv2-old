@@ -11,9 +11,8 @@
  */
 
 #include "includes.h"
-#ifdef ANDROID
 #include <sys/stat.h>
-#endif /* ANDROID */
+#include <fcntl.h>
 
 #include "common.h"
 #include "config.h"
@@ -772,6 +771,30 @@ static void write_mka_ckn(FILE *f, struct wpa_ssid *ssid)
 #endif /* CONFIG_MACSEC */
 
 
+#ifdef CONFIG_PASN
+static void write_pasn_groups(FILE *f, struct wpa_ssid *ssid)
+{
+	char *value = wpa_config_get(ssid, "pasn_groups");
+
+	if (!value)
+		return;
+	fprintf(f, "\tpasn_groups=%s\n", value);
+	os_free(value);
+}
+#endif /* CONFIG_PASN */
+
+
+static void write_security_profiles(FILE *f, struct wpa_ssid *ssid)
+{
+	char *value = wpa_config_get(ssid, "security_profiles");
+
+	if (!value)
+		return;
+	fprintf(f, "\tsecurity_profiles=%s\n", value);
+	os_free(value);
+}
+
+
 static void wpa_config_write_network(FILE *f, struct wpa_ssid *ssid,
 				     struct wpa_config *config)
 {
@@ -1046,6 +1069,10 @@ static void wpa_config_write_network(FILE *f, struct wpa_ssid *ssid,
 #endif /* CONFIG_IEEE8021X_AUTH */
 	INT_DEF(drop_unicast_ip_in_l2_multicast, 1);
 	INT_DEF(always_use_proxy_arp, 0);
+#ifdef CONFIG_PASN
+	write_pasn_groups(f, ssid);
+#endif /* CONFIG_PASN */
+	write_security_profiles(f, ssid);
 #undef STR
 #undef INT
 #undef INT_DEF
@@ -1787,9 +1814,9 @@ static void wpa_config_write_global(FILE *f, struct wpa_config *config)
 			config->wowlan_disconnect_on_deinit);
 	if (config->rsn_overriding)
 		fprintf(f, "rsn_overriding=%d\n", config->rsn_overriding);
-#ifdef CONFIG_TESTING_OPTIONS
 	if (config->mld_force_single_link)
 		fprintf(f, "mld_force_single_link=1\n");
+#ifdef CONFIG_TESTING_OPTIONS
 	if (config->mld_connect_band_pref != MLD_CONNECT_BAND_PREF_AUTO)
 		fprintf(f, "mld_connect_band_pref=%d\n",
 			config->mld_connect_band_pref);
@@ -1813,6 +1840,8 @@ static void wpa_config_write_global(FILE *f, struct wpa_config *config)
 		fprintf(f, "pr_pasn_type=%d\n", config->pr_pasn_type);
 	if (config->pr_preferred_role)
 		fprintf(f, "pr_preferred_role=%d\n", config->pr_preferred_role);
+	if (config->security_profiles != DEFAULT_SECURITY_PROFILES)
+		fprintf(f, "security_profiles=%d\n", config->security_profiles);
 
 #ifdef CONFIG_PASN
 	if (config->pasn_groups) {
@@ -1845,6 +1874,11 @@ static void wpa_config_write_identity(FILE *f, struct wpa_dev_ik *dev_ik)
 #endif /* CONFIG_NO_CONFIG_WRITE */
 
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+	defined(__APPLE__) || defined(__OpenBSD__)
+#define WPAS_CONFIG_USE_OPEN
+#endif
+
 int wpa_config_write(const char *name, struct wpa_config *config)
 {
 #ifndef CONFIG_NO_CONFIG_WRITE
@@ -1857,29 +1891,62 @@ int wpa_config_write(const char *name, struct wpa_config *config)
 #endif /* CONFIG_NO_CONFIG_BLOBS */
 	int ret = 0;
 	const char *orig_name = name;
-	int tmp_len;
+	size_t tmp_len, prefix_len, suffix_len;
 	char *tmp_name;
+	struct stat file_stat;
+#ifdef WPAS_CONFIG_USE_OPEN
+	int fd;
+#else /* WPAS_CONFIG_USE_OPEN */
+	mode_t prev;
+#endif /* WPAS_CONFIG_USE_OPEN */
+	u8 suffix[8];
 
 	if (!name) {
 		wpa_printf(MSG_ERROR, "No configuration file for writing");
 		return -1;
 	}
 
-	tmp_len = os_strlen(name) + 5; /* allow space for .tmp suffix */
+	if (os_get_random(suffix, sizeof(suffix)) < 0)
+		return -1;
+
+	prefix_len = os_strlen(name) + 5;
+	suffix_len = 2 * sizeof(suffix);
+	tmp_len = prefix_len + suffix_len + 1;
 	tmp_name = os_malloc(tmp_len);
-	if (tmp_name) {
-		os_snprintf(tmp_name, tmp_len, "%s.tmp", name);
-		name = tmp_name;
+	if (!tmp_name)
+		return -1;
+
+	os_snprintf(tmp_name, tmp_len, "%s.tmp-", name);
+	wpa_snprintf_hex(tmp_name + prefix_len, suffix_len + 1,
+			 suffix, sizeof(suffix));
+	name = tmp_name;
+
+#ifdef WPAS_CONFIG_USE_OPEN
+	fd = open(name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+		  S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		wpa_printf(MSG_DEBUG, "Failed to create '%s'", name);
+		os_free(tmp_name);
+		return -1;
 	}
-
-	wpa_printf(MSG_DEBUG, "Writing configuration file '%s'", name);
-
+	f = fdopen(fd, "w");
+#else /* WPAS_CONFIG_USE_OPEN */
+	prev = umask(S_IRWXG | S_IRWXO);
 	f = fopen(name, "w");
+	umask(prev);
+#endif /* WPAS_CONFIG_USE_OPEN */
 	if (f == NULL) {
 		wpa_printf(MSG_DEBUG, "Failed to open '%s' for writing", name);
 		os_free(tmp_name);
 		return -1;
 	}
+
+	wpa_printf(MSG_DEBUG, "Writing configuration file '%s'", name);
+
+	if (stat(orig_name, &file_stat) == 0)
+		chmod(name,
+		      (file_stat.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO)) |
+		      S_IRUSR | S_IWUSR);
 
 	wpa_config_write_global(f, config);
 
@@ -1923,20 +1990,23 @@ int wpa_config_write(const char *name, struct wpa_config *config)
 
 	os_fdatasync(f);
 
-	fclose(f);
-
-	if (tmp_name) {
-		int chmod_ret = 0;
+	if (fclose(f) != 0) {
+		wpa_printf(MSG_DEBUG,
+			   "fclose() failed ton temporary configuration file: %s",
+			   strerror(errno));
+		ret = -1;
+	}
 
 #ifdef ANDROID
-		chmod_ret = chmod(tmp_name,
-				  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+	if (!ret)
+		ret = chmod(tmp_name, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 #endif /* ANDROID */
-		if (chmod_ret != 0 || rename(tmp_name, orig_name) != 0)
-			ret = -1;
+	if (!ret)
+		ret = rename(tmp_name, orig_name);
+	if (ret)
+		unlink(tmp_name);
 
-		os_free(tmp_name);
-	}
+	os_free(tmp_name);
 
 	wpa_printf(MSG_DEBUG, "Configuration file '%s' written %ssuccessfully",
 		   orig_name, ret ? "un" : "");

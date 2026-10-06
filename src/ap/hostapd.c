@@ -66,6 +66,7 @@ static int hostapd_broadcast_wep_clear(struct hostapd_data *hapd);
 #endif /* CONFIG_WEP */
 static int setup_interface2(struct hostapd_iface *iface);
 static void channel_list_update_timeout(void *eloop_ctx, void *timeout_ctx);
+static void hostapd_cleanup_unused_mlds(struct hapd_interfaces *interfaces);
 static void hostapd_interface_setup_failure_handler(void *eloop_ctx,
 						    void *timeout_ctx);
 
@@ -256,6 +257,37 @@ static int hostapd_iface_conf_changed(struct hostapd_config *newconf,
 }
 
 
+static int hostapd_remove_hapd_iface(struct hostapd_iface *hapd_iface)
+{
+	struct hapd_interfaces *interfaces;
+	size_t i;
+
+	hapd_iface->driver_ap_teardown =
+		!!(hapd_iface->drv_flags &
+		   WPA_DRIVER_FLAGS_AP_TEARDOWN_SUPPORT);
+
+	interfaces = hapd_iface->interfaces;
+	for (i = 0; i < interfaces->count; i++) {
+		if (interfaces->iface[i] == hapd_iface)
+			break;
+	}
+
+	if (i >= interfaces->count)
+		return -1;
+
+	hostapd_interface_deinit_free(hapd_iface);
+
+	while (i < interfaces->count - 1) {
+		interfaces->iface[i] = interfaces->iface[i + 1];
+		i++;
+	}
+	interfaces->count--;
+
+	hostapd_cleanup_unused_mlds(interfaces);
+	return 0;
+}
+
+
 int hostapd_reload_config(struct hostapd_iface *iface)
 {
 	struct hapd_interfaces *interfaces = iface->interfaces;
@@ -292,7 +324,12 @@ int hostapd_reload_config(struct hostapd_iface *iface)
 			hostapd_config_free(newconf);
 			return -1;
 		}
-		hostapd_remove_iface(interfaces, hapd->conf->iface);
+		if (hostapd_remove_hapd_iface(iface) != 0) {
+			os_free(fname);
+			hostapd_config_free(newconf);
+			return -1;
+		}
+
 		iface = hostapd_init(interfaces, fname);
 		os_free(fname);
 		hostapd_config_free(newconf);
@@ -742,6 +779,7 @@ void hostapd_cleanup_iface_partial(struct hostapd_iface *iface)
 	airtime_policy_update_deinit(iface);
 	hostapd_free_multi_hw_info(iface->multi_hw_info);
 	iface->multi_hw_info = NULL;
+	iface->num_multi_hws = 0;
 	iface->current_hw_info = NULL;
 }
 
@@ -756,6 +794,7 @@ void hostapd_cleanup_iface_partial(struct hostapd_iface *iface)
 static void hostapd_cleanup_iface(struct hostapd_iface *iface)
 {
 	wpa_printf(MSG_DEBUG, "%s(%p)", __func__, iface);
+	hostapd_afc_stop(iface);
 	eloop_cancel_timeout(hostapd_interface_setup_failure_handler, iface,
 			     NULL);
 
@@ -765,6 +804,12 @@ static void hostapd_cleanup_iface(struct hostapd_iface *iface)
 
 	os_free(iface->config_fname);
 	os_free(iface->bss);
+#ifdef CONFIG_AFC
+	wpabuf_free(iface->afc_request);
+	os_free(iface->afc_response);
+	os_free(iface->afc.chan_info_list);
+	os_free(iface->afc.freq_range);
+#endif /* CONFIG_AFC */
 	wpa_printf(MSG_DEBUG, "%s: free iface=%p", __func__, iface);
 	os_free(iface);
 }
@@ -2602,6 +2647,11 @@ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
 		if (iface->assisted_dfs) {
 			wpa_printf(MSG_DEBUG,
 				   "Request to start AP with assisted DFS");
+			if (hapd->started) {
+				wpa_printf(MSG_DEBUG,
+					   "AP already started, bypass assisted DFS setup request");
+				goto dfs_offload;
+			}
 		} else if (!(iface->drv_flags & WPA_DRIVER_FLAGS_DFS_OFFLOAD)) {
 			/* Handle DFS only if it is not offloaded to the driver
 			 */
@@ -2640,6 +2690,16 @@ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
 			delay_apply_cfg = 1;
 		}
 #endif /* CONFIG_MESH */
+
+#ifdef CONFIG_IEEE80211AX
+		/* Check AFC for 6 GHz channels. */
+		res = hostapd_afc_handle_request(iface);
+		if (res <= 0) {
+			if (res < 0)
+				goto fail;
+			return res;
+		}
+#endif /* CONFIG_IEEE80211AX */
 
 		if (!delay_apply_cfg &&
 		    hostapd_set_freq(hapd, hapd->iconf->hw_mode, iface->freq,
@@ -2765,6 +2825,11 @@ dfs_offload:
 		}
 	}
 #endif /* CONFIG_FST */
+
+#ifdef CONFIG_AFC
+	if (iface->afc.data_valid)
+		wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, AFC_EVENT_COMPLETE);
+#endif /* CONFIG_AFC */
 
 	hostapd_set_state(iface, HAPD_IFACE_ENABLED);
 	hostapd_owe_update_trans(iface);
@@ -3025,6 +3090,7 @@ void hostapd_interface_deinit(struct hostapd_iface *iface)
 
 	hostapd_set_state(iface, HAPD_IFACE_DISABLED);
 
+	hostapd_afc_stop(iface);
 	eloop_cancel_timeout(channel_list_update_timeout, iface, NULL);
 	iface->wait_channel_update = 0;
 	iface->is_no_ir = false;
@@ -4074,7 +4140,7 @@ static int hostapd_remove_bss(struct hostapd_iface *iface, unsigned int idx)
 int hostapd_remove_iface(struct hapd_interfaces *interfaces, char *buf)
 {
 	struct hostapd_iface *hapd_iface;
-	size_t i, j, k = 0;
+	size_t i, j;
 
 	for (i = 0; i < interfaces->count; i++) {
 		hapd_iface = interfaces->iface[i];
@@ -4082,21 +4148,7 @@ int hostapd_remove_iface(struct hapd_interfaces *interfaces, char *buf)
 			return -1;
 		if (!os_strcmp(hapd_iface->conf->bss[0]->iface, buf)) {
 			wpa_printf(MSG_INFO, "Remove interface '%s'", buf);
-			hapd_iface->driver_ap_teardown =
-				!!(hapd_iface->drv_flags &
-				   WPA_DRIVER_FLAGS_AP_TEARDOWN_SUPPORT);
-
-			hostapd_interface_deinit_free(hapd_iface);
-			k = i;
-			while (k < (interfaces->count - 1)) {
-				interfaces->iface[k] =
-					interfaces->iface[k + 1];
-				k++;
-			}
-			interfaces->count--;
-			hostapd_cleanup_unused_mlds(interfaces);
-
-			return 0;
+			return hostapd_remove_hapd_iface(hapd_iface);
 		}
 
 		for (j = 0; j < hapd_iface->conf->num_bss; j++) {
@@ -4192,6 +4244,7 @@ void hostapd_new_assoc_sta(struct hostapd_data *hapd, struct sta_info *sta,
 			const struct wpa_ptk *ptk;
 			const u8 *pmk;
 			size_t pmk_len;
+			u16 pasn_group = PASN_GROUP_NOT_SPECIFIED;
 
 			switch (sta->auth_alg) {
 			case WLAN_AUTH_EPPKE:
@@ -4203,6 +4256,7 @@ void hostapd_new_assoc_sta(struct hostapd_data *hapd, struct sta_info *sta,
 				ptk = &sta->pasn->ptk;
 				pmk = sta->pasn->pmk;
 				pmk_len = sta->pasn->pmk_len;
+				pasn_group = sta->pasn->group;
 				break;
 #ifdef CONFIG_IEEE8021X_AUTH
 			case WLAN_AUTH_802_1X:
@@ -4218,7 +4272,7 @@ void hostapd_new_assoc_sta(struct hostapd_data *hapd, struct sta_info *sta,
 				return;
 			}
 			wpa_store_eppke_pmk_ptk_sm(sta->wpa_sm, ptk, pmk,
-						   pmk_len);
+						   pmk_len, pasn_group);
 			wpa_auth_set_ptk_rekey_timer(sta->wpa_sm);
 		}
 #endif /* CONFIG_ENC_ASSOC */
@@ -4653,16 +4707,68 @@ static int hostapd_fill_csa_settings(struct hostapd_data *hapd,
 	int ret;
 	enum oper_chan_width chanwidth;
 	u8 chan;
+	int sec_channel_offset;
 
 	os_memset(&old_freq, 0, sizeof(old_freq));
 	if (!iface || !iface->freq || hapd->csa_in_progress)
 		return -1;
 
 	chanwidth = hostapd_chan_width_from_freq_params(&settings->freq_params);
+	sec_channel_offset = settings->freq_params.sec_channel_offset;
+#ifdef CONFIG_IEEE80211BE
+	/* When Switching to an 11BE channel, adjust the legacy BW and center
+	 * frequencies accordingly
+	 */
+	if (chanwidth == CONF_OPER_CHWIDTH_320MHZ ||
+	    settings->freq_params.punct_bitmap) {
+		enum oper_chan_width chan_op_bw = chanwidth;
+		u8 oper_centr_freq0_idx = 0, oper_centr_freq1_idx = 0, pri_chan = 0;
+
+		ieee80211_freq_to_chan(settings->freq_params.center_freq1,
+				       &oper_centr_freq0_idx);
+		ieee80211_freq_to_chan(settings->freq_params.center_freq2,
+				       &oper_centr_freq1_idx);
+		ieee80211_freq_to_chan(settings->freq_params.freq,
+				       &pri_chan);
+
+		punct_update_legacy_bw(settings->freq_params.punct_bitmap,
+				       pri_chan,
+				       &chan_op_bw,
+				       &oper_centr_freq0_idx,
+				       &oper_centr_freq1_idx);
+
+		/* Downgrade the EHT 320 MHz BW to legacy 160 MHz BW and
+		 * calculate the correspoding 160 MHz center freq for later
+		 * ECSA opclass calculation which needs legacy BW and
+		 * secondary channel offset.
+		 */
+		if (chan_op_bw == CONF_OPER_CHWIDTH_320MHZ) {
+			chan_op_bw = CONF_OPER_CHWIDTH_160MHZ;
+
+			if (pri_chan < oper_centr_freq0_idx)
+				oper_centr_freq0_idx -= 16;
+			else
+				oper_centr_freq0_idx += 16;
+		}
+
+		chanwidth = chan_op_bw;
+		if (oper_centr_freq0_idx == 0 || oper_centr_freq0_idx == pri_chan)
+			sec_channel_offset = 0;
+		else if (oper_centr_freq0_idx > pri_chan)
+			sec_channel_offset = 1;
+		else
+			sec_channel_offset = -1;
+
+		wpa_printf(MSG_DEBUG,
+			   "ECSA Legacy BW %d chan1 %d chan2 %d sec_chan %d",
+			   chan_op_bw, oper_centr_freq0_idx, oper_centr_freq1_idx,
+			   sec_channel_offset);
+	}
+#endif /* CONFIG_IEEE80211BE */
 
 	if (ieee80211_freq_to_channel_ext(
 		    settings->freq_params.freq,
-		    settings->freq_params.sec_channel_offset,
+		    sec_channel_offset,
 		    chanwidth,
 		    &hapd->iface->cs_oper_class,
 		    &chan) == NUM_HOSTAPD_MODES) {
@@ -4923,9 +5029,10 @@ int hostapd_fill_cca_settings(struct hostapd_data *hapd,
 {
 	struct hostapd_iface *iface = hapd->iface;
 	u8 old_color;
+	u8 old_disabled;
 	int ret;
 
-	if (!iface || iface->conf->he_op.he_bss_color_disabled)
+	if (!iface)
 		return -1;
 
 	settings->link_id = -1;
@@ -4935,12 +5042,16 @@ int hostapd_fill_cca_settings(struct hostapd_data *hapd,
 #endif /* CONFIG_IEEE80211BE */
 
 	old_color = iface->conf->he_op.he_bss_color;
+	old_disabled = iface->conf->he_op.he_bss_color_disabled;
+
 	iface->conf->he_op.he_bss_color = hapd->cca_color;
+	iface->conf->he_op.he_bss_color_disabled = 0;
 	ret = hostapd_build_beacon_data(hapd, &settings->beacon_after);
-	if (ret)
-		return ret;
 
 	iface->conf->he_op.he_bss_color = old_color;
+	iface->conf->he_op.he_bss_color_disabled = old_disabled;
+	if (ret)
+		return ret;
 
 	settings->cca_count = hapd->cca_count;
 	settings->cca_color = hapd->cca_color,
@@ -4976,6 +5087,14 @@ void hostapd_switch_color_timeout_handler(void *eloop_data, void *user_ctx)
 		hapd->first_color_collision.sec;
 	if (delta_t < DOT11BSS_COLOR_COLLISION_AP_PERIOD)
 		return;
+
+	/* IEEE Std 802.11-2024, 26.17.3.5.1: once the BSS color collision has
+	 * persisted for dot11BSSColorCollisionAPPeriod the AP shall set BSS
+	 * Color Disabled to 1. Set it now so that beacon_cca (built inside
+	 * hostapd_fill_cca_settings()) and any incidental beacon rebuild
+	 * during the CCA countdown carry the correct Disabled=1 state.
+	 */
+	hapd->iface->conf->he_op.he_bss_color_disabled = 1;
 
 	r = os_random() % HE_OPERATION_BSS_COLOR_MAX;
 	for (i = 0; i < HE_OPERATION_BSS_COLOR_MAX; i++) {
@@ -5468,19 +5587,30 @@ u8 hostapd_get_oper_class_of_bss(struct hostapd_data *hapd)
 	if (hapd->iconf->ieee80211be && !hostapd_is_eht_enabled(hapd) &&
 	    hapd->iface->freq) {
 		enum oper_chan_width bss_chwidth, iface_chwidth;
+		u8 seg0, seg1;
 		u8 chan;
 
 		iface_chwidth = hostapd_get_oper_chwidth(hapd->iconf);
-		bss_chwidth = hostapd_get_oper_chan_width_of_bss(hapd);
+		hostapd_get_oper_chan_info_of_bss(hapd, &bss_chwidth,
+						  &seg0, &seg1);
 
 		/* If the BSS channel width is different from the interface
 		 * channel width, re-compute the operating class as per the BSS
 		 * channel width.
 		 */
 		if (bss_chwidth != iface_chwidth) {
+			int secondary_channel = hapd->iconf->secondary_channel;
+
+			/* Check if legacy bandwidth is downgraded to 20 MHz
+			 * and derive operating class accordingly.
+			 */
+			if (seg0 == hapd->iconf->channel &&
+			    bss_chwidth == CONF_OPER_CHWIDTH_USE_HT)
+				secondary_channel = 0;
+
 			if (ieee80211_freq_to_channel_ext(
 				    hapd->iface->freq,
-				    hapd->iconf->secondary_channel,
+				    secondary_channel,
 				    bss_chwidth, &op_class,
 				    &chan) == NUM_HOSTAPD_MODES ||
 			    chan != hapd->iconf->channel)

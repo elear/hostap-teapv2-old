@@ -1336,7 +1336,13 @@ void wpas_dpp_tx_wait_expire(struct wpa_supplicant *wpa_s)
 	int freq;
 
 #ifdef CONFIG_DPP3
-	if (wpa_s->dpp_pb_announcement && wpa_s->dpp_pb_discovery_done) {
+	if (wpa_s->dpp_pb_announcement && !wpa_s->dpp_pb_discovery_done) {
+		/* The TX wait window expired before the TX status callback
+		 * fired, meaning the frame was not sent successfully. Once
+		 * the Configurator has been discovered (dpp_pb_discovery_done),
+		 * the TX status callback always handles the retry itself, so
+		 * do not schedule an additional wpas_dpp_pb_next() here to
+		 * avoid running it twice. */
 		wpa_printf(MSG_DEBUG,
 			   "DPP: Failed to send push button announcement");
 		if (eloop_register_timeout(0, 0, wpas_dpp_pb_next,
@@ -1406,7 +1412,8 @@ static struct wpa_ssid * wpas_dpp_add_network(struct wpa_supplicant *wpa_s,
 		if (res == 0 &&
 		    !(capa.key_mgmt_iftype[WPA_IF_STATION] &
 		      WPA_DRIVER_CAPA_KEY_MGMT_SAE) &&
-		    !(wpa_s->drv_flags & WPA_DRIVER_FLAGS_SAE)) {
+		    !(wpa_s->drv_flags & WPA_DRIVER_FLAGS_SAE) &&
+		    !(wpa_s->drv_flags2 & WPA_DRIVER_FLAGS2_SAE_OFFLOAD_STA)) {
 			wpa_printf(MSG_DEBUG,
 				   "DPP: SAE not supported by the driver");
 			return NULL;
@@ -1445,6 +1452,9 @@ static struct wpa_ssid * wpas_dpp_add_network(struct wpa_supplicant *wpa_s,
 		goto fail;
 	os_memcpy(ssid->ssid, conf->ssid, conf->ssid_len);
 	ssid->ssid_len = conf->ssid_len;
+
+	if (!wpa_bss_get(wpa_s, NULL, conf->ssid, conf->ssid_len))
+		ssid->scan_ssid = 1;
 
 #ifdef CONFIG_DPP3
 	if (conf->akm == DPP_AKM_SAE && conf->password_id[0]) {
@@ -5548,6 +5558,7 @@ static void wpas_dpp_pb_tx_status(struct wpa_supplicant *wpa_s,
 		wpa_printf(MSG_DEBUG,
 			   "DPP: Failed to send push button announcement on %d MHz",
 			   freq);
+		offchannel_send_action_done(wpa_s);
 		if (eloop_register_timeout(0, 0, wpas_dpp_pb_next,
 					   wpa_s, NULL) < 0)
 			wpas_dpp_push_button_stop(wpa_s);
@@ -5844,6 +5855,8 @@ void wpas_dpp_push_button_stop(struct wpa_supplicant *wpa_s)
 		wpas_abort_ongoing_scan(wpa_s);
 		wpa_s->scan_res_handler = NULL;
 	}
+
+	offchannel_send_action_done(wpa_s);
 }
 
 #endif /* CONFIG_DPP3 */

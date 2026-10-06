@@ -22,9 +22,9 @@ SAE_PK_21_M = "1c63c1b17e9a999f0693b4341a970a63"
 SAE_PK_21_PK = "MIHcAgEBBEIBnFBjU0ywxo1dLTYcg2aZdMfNY7JHt4GTADRTgJ7RRo9qzRIlfmK7p+BP1c8YM8ia8v7YDTut00rDOfzkdmLOi0WgBwYFK4EEACOhgYkDgYYABAD6n3DHI+qaj/lElhe2sUSKqAe4sweckMlr9bhdmwp8Wsx5lKR/Tt7WPexeqFrA47nChw5WMWy6qJanCKNFvGYG0ADUWnxesYczGtCdUYJQgs3X5tHSapMssz6tP8QL0X9adTI/H3tFYhiVIdor03eZDUVnej78/F31CcHcjGBEyItVfw=="
 
 def run_sae_pk(apdev, dev, ssid, pw, m, pk, ap_groups=None,
-               confirm_immediate=False):
+               confirm_immediate=False, key_mgmt='SAE'):
     params = hostapd.wpa2_params(ssid=ssid)
-    params['wpa_key_mgmt'] = 'SAE'
+    params['wpa_key_mgmt'] = key_mgmt
     params['sae_password'] = ['%s|pk=%s:%s' % (pw, m, pk)]
     if ap_groups:
         params['sae_groups'] = ap_groups
@@ -33,7 +33,7 @@ def run_sae_pk(apdev, dev, ssid, pw, m, pk, ap_groups=None,
     hapd = hostapd.add_ap(apdev, params)
     bssid = hapd.own_addr()
 
-    dev.connect(ssid, sae_password=pw, key_mgmt="SAE", scan_freq="2412")
+    dev.connect(ssid, sae_password=pw, key_mgmt=key_mgmt, scan_freq="2412")
     bss = dev.get_bss(bssid)
     if 'flags' not in bss:
         raise Exception("Could not get BSS flags from BSS table")
@@ -98,6 +98,19 @@ def test_sae_pk_sec_5(dev, apdev):
     m = "d2e5fa27d1be8897f987f2d480d2af6b"
     run_sae_pk(apdev[0], dev[0], SAE_PK_SSID, pw, m, SAE_PK_19_PK)
 
+def test_sae_pk_group_19_ext_key(dev, apdev):
+    """SAE-PK with group 19 (ext key)"""
+    check_sae_pk_capab(dev[0])
+    dev[0].flush_scan_cache()
+    dev[0].set("sae_groups", "19")
+
+    try:
+        run_sae_pk(apdev[0], dev[0], SAE_PK_SSID, SAE_PK_SEC3_PW,
+                   SAE_PK_SEC3_M, SAE_PK_19_PK, ap_groups="19",
+                   key_mgmt="SAE-EXT-KEY")
+    finally:
+        dev[0].set("sae_groups", "")
+
 def test_sae_pk_group_20(dev, apdev):
     """SAE-PK with group 20"""
     check_sae_pk_capab(dev[0])
@@ -110,6 +123,19 @@ def test_sae_pk_group_20(dev, apdev):
     finally:
         dev[0].set("sae_groups", "")
 
+def test_sae_pk_group_20_ext_key(dev, apdev):
+    """SAE-PK with group 20"""
+    check_sae_pk_capab(dev[0])
+    dev[0].flush_scan_cache()
+    dev[0].set("sae_groups", "20")
+
+    try:
+        run_sae_pk(apdev[0], dev[0], SAE_PK_SSID, SAE_PK_20_PW,
+                   SAE_PK_20_M, SAE_PK_20_PK, ap_groups="20",
+                   key_mgmt="SAE-EXT-KEY")
+    finally:
+        dev[0].set("sae_groups", "")
+
 def test_sae_pk_group_21(dev, apdev):
     """SAE-PK with group 21"""
     check_sae_pk_capab(dev[0])
@@ -119,6 +145,19 @@ def test_sae_pk_group_21(dev, apdev):
     try:
         run_sae_pk(apdev[0], dev[0], SAE_PK_SSID, SAE_PK_21_PW,
                    SAE_PK_21_M, SAE_PK_21_PK, ap_groups="21")
+    finally:
+        dev[0].set("sae_groups", "")
+
+def test_sae_pk_group_21_ext_key(dev, apdev):
+    """SAE-PK with group 21 (ext key)"""
+    check_sae_pk_capab(dev[0])
+    dev[0].flush_scan_cache()
+    dev[0].set("sae_groups", "21")
+
+    try:
+        run_sae_pk(apdev[0], dev[0], SAE_PK_SSID, SAE_PK_21_PW,
+                   SAE_PK_21_M, SAE_PK_21_PK, ap_groups="21",
+                   key_mgmt="SAE-EXT-KEY")
     finally:
         dev[0].set("sae_groups", "")
 

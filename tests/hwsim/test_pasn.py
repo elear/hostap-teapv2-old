@@ -27,7 +27,7 @@ def check_pasn_capab(dev):
     if "PASN" not in dev.get_capability("auth_alg"):
         raise HwsimSkip("PASN not supported")
 
-def pasn_ap_params(akmp="PASN", cipher="CCMP", group="19"):
+def pasn_ap_params(akmp="PASN", cipher="CCMP", group="19", rsno=False):
     params = {"ssid": "test-wpa2-pasn",
               "wpa_passphrase": "12345678",
               "wpa": "2",
@@ -35,6 +35,11 @@ def pasn_ap_params(akmp="PASN", cipher="CCMP", group="19"):
               "wpa_key_mgmt": "WPA-PSK " + akmp,
               "rsn_pairwise": cipher,
               "pasn_groups" : group}
+
+    if rsno:
+        params['rsn_override_key_mgmt'] = akmp + ' SAE-EXT-KEY'
+        params['rsn_override_pairwise'] = 'CCMP GCMP-256'
+        params['rsn_override_mfp'] = '2'
 
     return params
 
@@ -170,6 +175,19 @@ def test_pasn_gcmp_256(dev, apdev):
     hapd = start_pasn_ap(apdev[0], params)
 
     check_pasn_akmp_cipher(dev[0], hapd, "PASN", "GCMP-256")
+
+def test_pasn_ccmp_ap_rsno(dev, apdev):
+    """PASN authentication with WPA2/CCMP AP that enables RSNO"""
+    check_pasn_capab(dev[0])
+
+    params = pasn_ap_params("PASN", "CCMP", "19", rsno=True)
+    hapd = start_pasn_ap(apdev[0], params)
+
+    try:
+        dev[0].set("rsn_overriding", "1")
+        check_pasn_akmp_cipher(dev[0], hapd, "PASN", "CCMP")
+    finally:
+        dev[0].set("rsn_overriding", "0")
 
 @remote_compatible
 def test_pasn_group_mismatch(dev, apdev):
@@ -1433,3 +1451,53 @@ def test_pasn_group_negotiation_downgrade_attack(dev, apdev):
     # carries the real supported groups {19, 20, 21}. The station detects that
     # the previously rejected group 19 reappears and aborts.
     check_pasn_sta_groups(dev[0], hapd, expected_status=1)
+
+def run_pasn_ltf_keyseed_required(apdev, ap_secure_ltf, sta_secure_ltf,
+                                  expected_status):
+    params = pasn_ap_params("PASN", "CCMP", "19")
+    if ap_secure_ltf:
+        params['driver_params'] = "secure_ltf=1"
+    hapd = start_pasn_ap(apdev[0], params)
+
+    wpas = WpaSupplicant(global_iface='/tmp/wpas-wlan5')
+    if sta_secure_ltf:
+        wpas.interface_add("wlan5", drv_params="secure_ltf=1")
+    else:
+        wpas.interface_add("wlan5")
+    check_pasn_capab(wpas)
+
+    wpas.flush_scan_cache()
+    wpas.scan(type="ONLY", freq=2412)
+    bssid = hapd.own_addr()
+
+    cmd = "PASN_DRIVER auth bssid=%s akmp=PASN cipher=CCMP ltf_keyseed_required" % bssid
+    resp = wpas.request(cmd)
+    if "OK" not in resp:
+        raise Exception("Failed to queue PASN authentication")
+
+    ev = wpas.wait_event(["PASN-AUTH-STATUS"], timeout=10)
+    if ev is None:
+        raise Exception("No PASN-AUTH-STATUS event received")
+    if bssid.upper() not in ev.upper():
+        raise Exception("Unexpected BSSID in PASN-AUTH-STATUS: " + ev)
+    if "status=%d" % expected_status not in ev:
+        raise Exception("Unexpected status in PASN-AUTH-STATUS (expected %d): %s" %
+                        (expected_status, ev))
+
+def test_pasn_ltf_keyseed_required_success(dev, apdev):
+    """PASN: ltf_keyseed_required succeeds when both sides support Secure LTF"""
+    run_pasn_ltf_keyseed_required(apdev,
+                                  ap_secure_ltf=True, sta_secure_ltf=True,
+                                  expected_status=0)
+
+def test_pasn_ltf_keyseed_required_no_sta_secure_ltf(dev, apdev):
+    """PASN: ltf_keyseed_required fails when local device lacks Secure LTF"""
+    run_pasn_ltf_keyseed_required(apdev,
+                                  ap_secure_ltf=True, sta_secure_ltf=False,
+                                  expected_status=1)
+
+def test_pasn_ltf_keyseed_required_no_ap_secure_ltf(dev, apdev):
+    """PASN: ltf_keyseed_required fails when peer AP lacks Secure LTF"""
+    run_pasn_ltf_keyseed_required(apdev,
+                                  ap_secure_ltf=False, sta_secure_ltf=True,
+                                  expected_status=1)

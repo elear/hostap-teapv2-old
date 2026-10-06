@@ -146,8 +146,8 @@ static int ieee802_11_send_wnmsleep_resp(struct hostapd_data *hapd,
 #endif /* CONFIG_OCV */
 
 #define MAX_GTK_SUBELEM_LEN 45
-#define MAX_IGTK_SUBELEM_LEN 26
-#define MAX_BIGTK_SUBELEM_LEN 26
+#define MAX_IGTK_SUBELEM_LEN 10 + WPA_IGTK_MAX_LEN
+#define MAX_BIGTK_SUBELEM_LEN 10 + WPA_BIGTK_MAX_LEN
 	mgmt = os_zalloc(sizeof(*mgmt) + wnmsleep_ie_len + wnmtfs_ie_len +
 			 MAX_GTK_SUBELEM_LEN + MAX_IGTK_SUBELEM_LEN +
 			 MAX_BIGTK_SUBELEM_LEN +
@@ -475,7 +475,7 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
 	}
 	wpa_msg(hapd->msg_ctx, MSG_INFO,
 		BSS_TM_QUERY MACSTR " reason=%u%s%s",
-		MAC2STR(addr), reason, hex ? " neighbor=" : "", hex);
+		MAC2STR(addr), reason, hex ? " neighbor=" : "", hex ? hex : "");
 	os_free(hex);
 
 	ieee802_11_send_bss_trans_mgmt_request(hapd, addr, dialog_token);

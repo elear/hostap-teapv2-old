@@ -460,6 +460,12 @@ static int ieee802_11_parse_extension(const u8 *pos, size_t elen,
 		elems->uhr_operation = pos;
 		elems->uhr_operation_len = elen;
 		break;
+	case WLAN_EID_EXT_SECURITY_PROFILE:
+		if (elen < 2)
+			break;
+		elems->security_profile = pos;
+		elems->security_profile_len = elen;
+		break;
 	default:
 		if (show_errors) {
 			wpa_printf(MSG_MSGDUMP,
@@ -477,6 +483,40 @@ static int ieee802_11_parse_extension(const u8 *pos, size_t elen,
 }
 
 
+static int ieee802_11_parse_ext_len_elem(const struct ext_len_element *elem,
+					 struct ieee802_11_elems *elems,
+					 int show_errors)
+{
+	u16 id, info_len;
+	const u8 *pos;
+
+	id = le_to_host16(elem->ext_id);
+	info_len = le_to_host16(elem->datalen);
+	pos = elem->data;
+
+	switch (id) {
+	case WLAN_EID_EXT_LEN_PQC_PARAMETER:
+		/* The elements contains at least the Security Profile Number
+		 * and Content Presence fields. */
+		if (info_len < 2)
+			break;
+
+		elems->pqc_parameter = pos;
+		elems->pqc_parameter_len = info_len;
+		break;
+	default:
+		if (show_errors) {
+			wpa_printf(MSG_MSGDUMP,
+				   "IEEE 802.11 element parsing ignored unknown extended length element (id=%u elen=%u)",
+				   id, info_len);
+		}
+		return -1;
+	}
+
+	return 0;
+}
+
+
 static ParseRes __ieee802_11_parse_elems(const u8 *start, size_t len,
 					 struct ieee802_11_elems *elems,
 					 int show_errors)
@@ -488,15 +528,26 @@ static ParseRes __ieee802_11_parse_elems(const u8 *start, size_t len,
 		return ParseOK;
 
 	for_each_element(elem, start, len) {
-		u8 id = elem->id, elen = elem->datalen;
-		const u8 *pos = elem->data;
+		u8 id = elem->id, elen;
+		const u8 *pos;
 		size_t *total_len = NULL;
 
 		if (id == WLAN_EID_FRAGMENT && elems->num_frag_elems > 0) {
 			elems->num_frag_elems--;
 			continue;
 		}
+
 		elems->num_frag_elems = 0;
+		if (id == WLAN_EID_EXT_LENGTH) {
+			if (ieee802_11_parse_ext_len_elem(
+				    (const struct ext_len_element *) elem,
+				    elems, show_errors))
+				unknown++;
+			continue;
+		}
+
+		elen = elem->datalen;
+		pos = elem->data;
 
 		switch (id) {
 		case WLAN_EID_SSID:
@@ -1041,6 +1092,10 @@ void ieee802_11_elems_clear_ext_ids(struct ieee802_11_elems *elems,
 		case WLAN_EID_EXT_UHR_OPERATION:
 			elems->uhr_operation = NULL;
 			elems->uhr_operation_len = 0;
+			break;
+		case WLAN_EID_EXT_SECURITY_PROFILE:
+			elems->security_profile = NULL;
+			elems->security_profile_len = 0;
 			break;
 		}
 	}
@@ -3649,6 +3704,7 @@ ssize_t ieee802_11_defrag_mle_subelem(struct wpabuf *mlbuf,
 
 		os_memmove(pos, pos + 2, end - (pos + 2));
 		end -= 2;
+		mlbuf->used -= 2;
 		pos += elen - 2;
 		subelem_len += elen - 2;
 
@@ -3709,7 +3765,8 @@ const u8 * get_basic_mle_eml_capa(const u8 *buf, size_t len)
 	size_t common_info_limit;
 	u8 common_info_len;
 
-	if (len < MULTI_LINK_CONTROL_LEN)
+	/* The Common Info Length field follows the Multi-Link Control field */
+	if (len < MULTI_LINK_CONTROL_LEN + 1)
 		return NULL;
 
 	ctrl = le_to_host16(ml->ml_control);
@@ -3754,7 +3811,8 @@ int get_basic_mle_link_id(const u8 *buf, size_t len)
 	u8 common_info_len;
 	u8 link_id;
 
-	if (len < MULTI_LINK_CONTROL_LEN)
+	/* The Common Info Length field follows the Multi-Link Control field */
+	if (len < MULTI_LINK_CONTROL_LEN + 1)
 		return -1;
 
 	ctrl = le_to_host16(ml->ml_control);
@@ -3853,7 +3911,11 @@ unsigned int get_max_nss_capability(struct ieee802_11_elems *elems,
 		(struct ieee80211_he_capabilities *) elems->he_capabilities;
 	le16 mcs_map;
 
-	if (hecaps) {
+	if (hecaps &&
+	    (bw != CHAN_WIDTH_160 ||
+	     elems->he_capabilities_len >= HE_CAPABILITIES_ELEM_MIN_LEN + 4) &&
+	    (bw != CHAN_WIDTH_80P80 ||
+	     elems->he_capabilities_len >= HE_CAPABILITIES_ELEM_MIN_LEN + 8)) {
 		unsigned int max_nss_he;
 		const u8 *optional = hecaps->optional;
 
@@ -3899,22 +3961,30 @@ unsigned int get_max_nss_capability(struct ieee802_11_elems *elems,
 
 /* Parse VHT/HE capabilities elements to get supported channel width */
 struct supported_chan_width
-get_supported_channel_width(struct ieee802_11_elems *elems)
+get_supported_channel_width(struct ieee802_11_elems *elems, int freq)
 {
 	struct supported_chan_width supported_width;
+	struct ieee80211_ht_capabilities *htcaps;
 	struct ieee80211_vht_capabilities *vhtcaps;
 	struct ieee80211_he_capabilities *hecaps;
 	struct ieee80211_eht_capabilities *ehtcaps;
 
+	supported_width.is_40_supported = false;
 	supported_width.is_160_supported = false;
 	supported_width.is_80p80_supported = false;
 	supported_width.is_320_supported = false;
 	if (!elems)
 		return supported_width;
 
+	htcaps = (struct ieee80211_ht_capabilities *) elems->ht_capabilities;
 	vhtcaps = (struct ieee80211_vht_capabilities *) elems->vht_capabilities;
 	hecaps = (struct ieee80211_he_capabilities *) elems->he_capabilities;
 	ehtcaps = (struct ieee80211_eht_capabilities *) elems->eht_capabilities;
+
+	if (htcaps &&
+	    (le_to_host16(htcaps->ht_capabilities_info) &
+	     HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET))
+		supported_width.is_40_supported = true;
 
 	if (vhtcaps) {
 		u32 vht_capabilities_info =
@@ -3932,6 +4002,19 @@ get_supported_channel_width(struct ieee802_11_elems *elems)
 	if (hecaps) {
 		u8 channel_width_set = hecaps->he_phy_capab_info[
 			HE_PHYCAP_CHANNEL_WIDTH_SET_IDX];
+
+		/*
+		 * The 40 MHz capability is band specific in HE: a bit for 2.4
+		 * GHz vs. the shared 40/80 MHz bit for 5 GHz.
+		 */
+		if (is_24ghz_freq(freq)) {
+			if (channel_width_set &
+			    HE_PHYCAP_CHANNEL_WIDTH_SET_40MHZ_IN_2G)
+				supported_width.is_40_supported = true;
+		} else if (channel_width_set &
+			   HE_PHYCAP_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G) {
+			supported_width.is_40_supported = true;
+		}
 
 		if (channel_width_set &
 		    HE_PHYCAP_CHANNEL_WIDTH_SET_160MHZ_IN_5G)
@@ -4154,6 +4237,10 @@ enum chan_width get_sta_operation_chan_width(
 	if (ap_operation_chan_width == CHAN_WIDTH_80P80)
 		return sta_supported_chan_width.is_80p80_supported ?
 			CHAN_WIDTH_80P80 : CHAN_WIDTH_80;
+
+	if (ap_operation_chan_width == CHAN_WIDTH_40)
+		return sta_supported_chan_width.is_40_supported ?
+			CHAN_WIDTH_40 : CHAN_WIDTH_20;
 
 	return ap_operation_chan_width;
 }

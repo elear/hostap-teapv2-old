@@ -539,6 +539,8 @@ static void nl80211_deliver_pending_events(void *eloop_ctx, void *data)
 	if (dl_list_empty(&global->pending_events))
 		return;
 
+	global->delivering_pending_events = true;
+
 	dl_list_init(&pending_events);
 
 	global->pending_events.next->prev = &pending_events;
@@ -555,6 +557,8 @@ static void nl80211_deliver_pending_events(void *eloop_ctx, void *data)
 		event->handler(event->msg, event->data);
 		nl80211_remove_pending_event(event);
 	}
+
+	global->delivering_pending_events = false;
 }
 
 
@@ -575,9 +579,20 @@ int nl80211_reply_hook(struct nl80211_global *global, struct nl_msg *msg,
 		 * to read the socket again (it should usually, but it may not
 		 * if multiple timeouts have expired). As such, check here if
 		 * there are already pending events, and if there are, queue
-		 * this one.
+		 * this one to preserve delivery order.
+		 *
+		 * However, if we are already inside
+		 * nl80211_deliver_pending_events(), do not re-queue events
+		 * triggered by event handlers. Re-queuing during delivery
+		 * causes events to accumulate across command cycles. When the
+		 * accumulated event count is large enough, a re-queued event's
+		 * sequence number eventually matches the reply_seq of a
+		 * concurrent send_and_recv_glb() call, causing the reply
+		 * handler to fire with the wrong message and corrupt the
+		 * caller's stack.
 		 */
-		if (!dl_list_empty(&global->pending_events))
+		if (!dl_list_empty(&global->pending_events) &&
+		    !global->delivering_pending_events)
 			goto queue_event;
 
 		return NL_OK;
@@ -3754,6 +3769,7 @@ static void wpa_driver_nl80211_deinit(struct i802_bss *bss)
 		nl80211_mgmt_unsubscribe(bss, "deinit");
 		nl80211_del_non_netdev(bss);
 	}
+	nl80211_put_wiphy_data_ap(bss);
 
 	nl80211_destroy_bss(drv->first_bss);
 
@@ -6023,21 +6039,28 @@ static int wpa_driver_nl80211_set_ap(void *priv,
 		wpa_printf(MSG_DEBUG, "nl80211: he_spr_ctrl=0x%x",
 			   params->he_spr_ctrl);
 
+		/* The HE OBSS PD offset attributes were added with incorrect
+		 * range 1-20 in cfg80211. 0 is a valid value, but that gets
+		 * rejected. As a workaround, omit these elements when their
+		 * value is 0 since cfg80211 ends up using that as 0. */
 		if (!spr ||
 		    nla_put_u8(msg, NL80211_HE_OBSS_PD_ATTR_SR_CTRL,
 			       params->he_spr_ctrl) ||
 		    ((params->he_spr_ctrl &
 		      SPATIAL_REUSE_NON_SRG_OFFSET_PRESENT) &&
+		     params->he_spr_non_srg_obss_pd_max_offset &&
 		     nla_put_u8(msg, NL80211_HE_OBSS_PD_ATTR_NON_SRG_MAX_OFFSET,
 				params->he_spr_non_srg_obss_pd_max_offset)))
 			goto fail;
 
 		if ((params->he_spr_ctrl &
 		     SPATIAL_REUSE_SRG_INFORMATION_PRESENT) &&
-		    (nla_put_u8(msg, NL80211_HE_OBSS_PD_ATTR_MIN_OFFSET,
-				params->he_spr_srg_obss_pd_min_offset) ||
-		     nla_put_u8(msg, NL80211_HE_OBSS_PD_ATTR_MAX_OFFSET,
-				params->he_spr_srg_obss_pd_max_offset) ||
+		    ((params->he_spr_srg_obss_pd_min_offset &&
+		      nla_put_u8(msg, NL80211_HE_OBSS_PD_ATTR_MIN_OFFSET,
+				params->he_spr_srg_obss_pd_min_offset)) ||
+		     (params->he_spr_srg_obss_pd_max_offset &&
+		      nla_put_u8(msg, NL80211_HE_OBSS_PD_ATTR_MAX_OFFSET,
+				params->he_spr_srg_obss_pd_max_offset)) ||
 		     nla_put(msg, NL80211_HE_OBSS_PD_ATTR_BSS_COLOR_BITMAP,
 			     sizeof(params->he_spr_bss_color_bitmap),
 			     params->he_spr_bss_color_bitmap) ||
@@ -6924,6 +6947,24 @@ static int nl80211_create_iface_once(struct wpa_driver_nl80211_data *drv,
 }
 
 
+static int nl80211_use_existing_iface(struct wpa_driver_nl80211_data *drv,
+				      const char *ifname,
+				      enum nl80211_iftype iftype,
+				      const u8 *addr)
+{
+	wpa_printf(MSG_DEBUG, "nl80211: Continue using existing interface %s",
+		   ifname);
+	if (addr && iftype != NL80211_IFTYPE_MONITOR &&
+	    linux_set_ifhwaddr(drv->global->ioctl_sock, ifname, addr) < 0 &&
+	    (linux_set_iface_flags(drv->global->ioctl_sock, ifname, 0) < 0 ||
+	     linux_set_ifhwaddr(drv->global->ioctl_sock, ifname, addr) < 0 ||
+	     linux_set_iface_flags(drv->global->ioctl_sock, ifname, 1) < 0))
+		return -1;
+
+	return -ENFILE;
+}
+
+
 int nl80211_create_iface(struct wpa_driver_nl80211_data *drv,
 			 const char *ifname, enum nl80211_iftype iftype,
 			 const u8 *addr, int wds,
@@ -6932,25 +6973,17 @@ int nl80211_create_iface(struct wpa_driver_nl80211_data *drv,
 {
 	int ret;
 
+	if (use_existing && if_nametoindex(ifname))
+		return nl80211_use_existing_iface(drv, ifname, iftype, addr);
+
 	ret = nl80211_create_iface_once(drv, ifname, iftype, addr, wds, handler,
 					arg);
 
 	/* if error occurred and interface exists already */
 	if (ret < 0 && if_nametoindex(ifname)) {
 		if (use_existing) {
-			wpa_printf(MSG_DEBUG, "nl80211: Continue using existing interface %s",
-				   ifname);
-			if (addr && iftype != NL80211_IFTYPE_MONITOR &&
-			    linux_set_ifhwaddr(drv->global->ioctl_sock, ifname,
-					       addr) < 0 &&
-			    (linux_set_iface_flags(drv->global->ioctl_sock,
-						   ifname, 0) < 0 ||
-			     linux_set_ifhwaddr(drv->global->ioctl_sock, ifname,
-						addr) < 0 ||
-			     linux_set_iface_flags(drv->global->ioctl_sock,
-						   ifname, 1) < 0))
-					return -1;
-			return -ENFILE;
+			return nl80211_use_existing_iface(drv, ifname, iftype,
+							  addr);
 		}
 		wpa_printf(MSG_INFO, "Try to remove and re-create %s", ifname);
 
@@ -7557,6 +7590,8 @@ static int nl80211_connect_common(struct wpa_driver_nl80211_data *drv,
 		}
 
 		drv->assoc_freq = params->freq.freq;
+	} else {
+		drv->assoc_freq = 0;
 	}
 
 	if (params->freq_hint) {
@@ -7899,13 +7934,23 @@ static int nl80211_connect_ext(struct i802_bss *bss,
 #endif /* CONFIG_ENC_ASSOC */
 
 #ifdef CONFIG_IEEE8021X_AUTH
-	if (params->auth_alg & WPA_AUTH_ALG_802_1X) {
+	if (params->ieee8021x_auth_supported) {
 		wpa_printf(MSG_DEBUG,
 			   "- IEEE 802.1X external authentication support");
 		connect_ext_feature_set(features,
 					QCA_CONNECT_EXT_FEATURE_EXT_AUTH_8021X);
 	}
 #endif /* CONFIG_IEEE8021X_AUTH */
+
+	if (params->okc_pmkid_in_assoc) {
+		wpa_printf(MSG_DEBUG,
+			   "- OKC derived PMKID in (Re)Association Request frames");
+		connect_ext_feature_set(features,
+					QCA_CONNECT_EXT_FEATURE_OKC_PMKID_IN_ASSOC);
+	}
+
+	wpa_printf(MSG_DEBUG, "- Roam status synchronization support");
+	connect_ext_feature_set(features, QCA_CONNECT_EXT_FEATURE_ROAM_STATUS);
 
 	if (nla_put(msg, QCA_WLAN_VENDOR_ATTR_CONNECT_EXT_FEATURES,
 		    sizeof(features), features))
@@ -8691,6 +8736,46 @@ static void get_sta_tid_stats(struct hostap_sta_driver_data *data,
 }
 
 
+static int get_link_sta_stats(struct hostap_sta_driver_data *data,
+			      struct nlattr **tb,
+			      struct nla_policy *stats_policy)
+{
+	struct nlattr *link;
+	int rem;
+
+	nla_for_each_nested(link, tb[NL80211_ATTR_MLO_LINKS], rem) {
+		struct nlattr *stats[NL80211_STA_INFO_MAX + 1];
+		struct nlattr *link_attr[NL80211_ATTR_MAX + 1];
+		u8 link_id;
+
+		if (nla_parse_nested(link_attr, NL80211_ATTR_MAX, link,
+				     NULL) != 0)
+			continue;
+
+		if (!link_attr[NL80211_ATTR_MLO_LINK_ID] ||
+		    !link_attr[NL80211_ATTR_STA_INFO])
+			continue;
+
+		link_id = nla_get_u8(link_attr[NL80211_ATTR_MLO_LINK_ID]);
+		if (link_id >= MAX_NUM_MLD_LINKS)
+			continue;
+		if (nla_parse_nested(stats, NL80211_STA_INFO_MAX,
+				     link_attr[NL80211_ATTR_STA_INFO],
+				     stats_policy) != 0)
+			continue;
+
+		if (!stats[NL80211_STA_INFO_INACTIVE_TIME])
+			continue;
+
+		data->valid_links |= BIT(link_id);
+		data->link_inactive_msec[link_id] =
+			nla_get_u32(stats[NL80211_STA_INFO_INACTIVE_TIME]);
+	}
+
+	return 0;
+}
+
+
 static int get_sta_handler(struct nl_msg *msg, void *arg)
 {
 	struct nlattr *tb[NL80211_ATTR_MAX + 1];
@@ -8745,15 +8830,33 @@ static int get_sta_handler(struct nl_msg *msg, void *arg)
 	 * the kernel starts sending station notifications.
 	 */
 
-	if (!tb[NL80211_ATTR_STA_INFO]) {
+	if (!tb[NL80211_ATTR_STA_INFO] && !tb[NL80211_ATTR_MLO_LINKS]) {
 		wpa_printf(MSG_DEBUG, "sta stats missing!");
 		return NL_SKIP;
 	}
-	if (nla_parse_nested(stats, NL80211_STA_INFO_MAX,
-			     tb[NL80211_ATTR_STA_INFO],
-			     stats_policy)) {
-		wpa_printf(MSG_DEBUG, "failed to parse nested attributes!");
+
+	/*
+	 * Parse only NL80211_ATTR_MLO_LINKS if that is set to fetch link level
+	 * statistics separately. If not set, proceed further with parsing
+	 * NL80211_ATTR_STA_INFO attribute.
+	 */
+	if (tb[NL80211_ATTR_MLO_LINKS]) {
+		if (get_link_sta_stats(data, tb, stats_policy)) {
+			wpa_printf(MSG_DEBUG,
+				   "nl80211: Failed to get link stats");
+			return NL_SKIP;
+		}
 		return NL_SKIP;
+	}
+
+	if (tb[NL80211_ATTR_STA_INFO]) {
+		if (nla_parse_nested(stats, NL80211_STA_INFO_MAX,
+				     tb[NL80211_ATTR_STA_INFO],
+				     stats_policy)) {
+			wpa_printf(MSG_DEBUG,
+				   "nl80211: Failed to parse nested attributes!");
+			return NL_SKIP;
+		}
 	}
 
 	if (stats[NL80211_STA_INFO_INACTIVE_TIME])
@@ -8976,8 +9079,10 @@ int nl80211_get_link_signal(struct i802_bss *bss, const u8 *bssid,
 	data->signal = -WPA_INVALID_NOISE;
 	data->current_tx_rate = 0;
 
-	if (!(msg = nl80211_bss_msg(bss, 0, NL80211_CMD_GET_STATION)) ||
-	    nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN, bssid)) {
+	if (!(msg = nl80211_bss_msg(bss, NLM_F_DUMP,
+				    NL80211_CMD_GET_STATION)) ||
+	    nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN, bssid) ||
+	    nla_put_flag(msg, NL80211_ATTR_STA_DUMP_LINK_STATS)) {
 		nlmsg_free(msg);
 		return -ENOBUFS;
 	}
@@ -8992,8 +9097,10 @@ static int i802_read_sta_data(struct i802_bss *bss,
 {
 	struct nl_msg *msg;
 
-	if (!(msg = nl80211_bss_msg(bss, 0, NL80211_CMD_GET_STATION)) ||
-	    nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN, addr)) {
+	if (!(msg = nl80211_bss_msg(bss, NLM_F_DUMP,
+				    NL80211_CMD_GET_STATION)) ||
+	    nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN, addr) ||
+	    nla_put_flag(msg, NL80211_ATTR_STA_DUMP_LINK_STATS)) {
 		nlmsg_free(msg);
 		return -ENOBUFS;
 	}
@@ -9109,16 +9216,27 @@ static int i802_set_sta_vlan(struct i802_bss *bss, const u8 *addr,
 static int i802_get_inact_sec(void *priv, const u8 *addr)
 {
 	struct hostap_sta_driver_data data;
-	int ret;
+	int ret, i;
+	unsigned long inactive_time;
 
 	os_memset(&data, 0, sizeof(data));
 	data.inactive_msec = (unsigned long) -1;
 	ret = i802_read_sta_data(priv, &data, addr);
 	if (ret == -ENOENT)
 		return -ENOENT;
-	if (ret || data.inactive_msec == (unsigned long) -1)
+	if (ret)
 		return -1;
-	return data.inactive_msec / 1000;
+
+	inactive_time = data.inactive_msec;
+	for_each_link(data.valid_links, i) {
+		if (inactive_time > data.link_inactive_msec[i])
+			inactive_time = data.link_inactive_msec[i];
+	}
+
+	if (inactive_time == -1UL)
+		return -1;
+
+	return inactive_time / 1000;
 }
 
 
@@ -10086,7 +10204,8 @@ static int wpa_driver_nl80211_send_action(struct i802_bss *bss,
 		int i;
 
 		modes = nl80211_get_hw_feature_data(bss, &num_modes,
-						    &flags, &dfs_domain);
+						    &flags, &dfs_domain,
+						    NULL, 0);
 		if (dfs_domain != HOSTAPD_DFS_REGION_ETSI &&
 		    ieee80211_is_dfs(bss->flink->freq, modes, num_modes))
 			offchanok = 0;
@@ -10391,10 +10510,17 @@ fail:
 }
 
 
-void nl80211_update_active_links(struct i802_bss *bss, int link_id)
+void nl80211_update_active_links(struct i802_bss *bss, int link_id,
+				 bool set_active_links)
 {
-	wpa_printf(MSG_DEBUG, "nl80211: Update link (ifindex=%d link_id=%u)",
-		   bss->ifindex, link_id);
+	wpa_printf(MSG_DEBUG, "nl80211: Update link (ifindex=%d link_id=%u %s)",
+		   bss->ifindex, link_id,
+		   set_active_links ? "START_AP" : "STOP_AP");
+
+	if (set_active_links) {
+		bss->active_links |= BIT(link_id);
+		return;
+	}
 
 	if (!(bss->active_links & BIT(link_id))) {
 		wpa_printf(MSG_DEBUG,
@@ -10435,7 +10561,7 @@ int nl80211_remove_link(struct i802_bss *bss, int link_id)
 
 	eloop_cancel_timeout(wpa_driver_nl80211_scan_timeout, drv, bss->ctx);
 	/* Clear the active links and set the flink */
-	nl80211_update_active_links(bss, link_id);
+	nl80211_update_active_links(bss, link_id, false);
 	bss->valid_links &= ~BIT(link_id);
 
 	if (bss->scan_link == link)
@@ -10787,11 +10913,23 @@ static int nl80211_mlo_signal_poll(void *priv,
 	mlo_si->valid_links = drv->sta_mlo_info.valid_links;
 
 	for_each_link(mlo_si->valid_links, i) {
+		/*
+		 * This should be requesting it not for each link, but for
+		 * the MLD address, and then parse out each link data.
+		 * However, that API isn't completed in the kernel yet,
+		 * and some non-upstream drivers erroneously implemented
+		 * a per-link query here. Be compatible with them for now,
+		 * but ignore if this fails since that happens upstream.
+		 *
+		 * Once a correct query is implemented outside the loop,
+		 * this should be skipped if the correct query returned
+		 * the necessary data.
+		 */
 		res = nl80211_get_link_signal(bss,
 					      drv->sta_mlo_info.links[i].bssid,
 					      &mlo_si->links[i].data);
-		if (res != 0)
-			return res;
+		if (res)
+			mlo_si->links[i].data.signal = -WPA_INVALID_NOISE;
 
 		mlo_si->links[i].center_frq1 = -1;
 		mlo_si->links[i].center_frq2 = -1;
@@ -11309,22 +11447,26 @@ static int wpa_driver_nl80211_get_survey(void *priv, unsigned int freq)
 
 static void nl80211_set_rekey_info(void *priv, const u8 *kek, size_t kek_len,
 				   const u8 *kck, size_t kck_len,
-				   const u8 *replay_ctr)
+				   const u8 *replay_ctr, int key_mgmt)
 {
 	struct i802_bss *bss = priv;
 	struct wpa_driver_nl80211_data *drv = bss->drv;
 	struct nlattr *replay_nested;
 	struct nl_msg *msg;
 	int ret;
+	int akm;
 
 	if (!drv->set_rekey_offload)
 		return;
+
+	akm = wpa_akm_to_suite(key_mgmt);
 
 	wpa_printf(MSG_DEBUG, "nl80211: Set rekey offload");
 	if (!(msg = nl80211_bss_msg(bss, 0, NL80211_CMD_SET_REKEY_OFFLOAD)) ||
 	    !(replay_nested = nla_nest_start(msg, NL80211_ATTR_REKEY_DATA)) ||
 	    nla_put(msg, NL80211_REKEY_DATA_KEK, kek_len, kek) ||
 	    (kck_len && nla_put(msg, NL80211_REKEY_DATA_KCK, kck_len, kck)) ||
+	    (akm && nla_put_u32(msg, NL80211_REKEY_DATA_AKM, akm)) ||
 	    nla_put(msg, NL80211_REKEY_DATA_REPLAY_CTR, NL80211_REPLAY_CTR_LEN,
 		    replay_ctr)) {
 		nl80211_nlmsg_clear(msg);
@@ -14559,6 +14701,10 @@ fail:
 }
 
 
+static const u8 qca_usd_default_network_id[ETH_ALEN] = {
+	0x51, 0x6f, 0x9a, 0x02, 0x00, 0x00
+};
+
 static int nl80211_nan_publish(void *priv, const u8 *src, int publish_id,
 			       const char *service_name, const u8 *service_id,
 			       enum nan_service_protocol_type srv_proto_type,
@@ -14602,8 +14748,10 @@ static int nl80211_nan_publish(void *priv, const u8 *src, int publish_id,
 		    wpabuf_len(elems), wpabuf_head(elems))) ||
 	    (ssi && nla_put(msg, QCA_WLAN_VENDOR_ATTR_USD_SSI,
 			    wpabuf_len(ssi), wpabuf_head(ssi))) ||
-	    (network_id && nla_put(msg, QCA_WLAN_VENDOR_ATTR_USD_NETWORK_ID,
-				   ETH_ALEN, network_id)))
+	    (network_id &&
+	     !ether_addr_equal(network_id, qca_usd_default_network_id) &&
+	     nla_put(msg, QCA_WLAN_VENDOR_ATTR_USD_NETWORK_ID, ETH_ALEN,
+		     network_id)))
 		goto fail;
 
 	attr = nla_nest_start(msg, QCA_WLAN_VENDOR_ATTR_USD_CHAN_CONFIG);
@@ -14758,8 +14906,10 @@ static int nl80211_nan_subscribe(void *priv, const u8 *src, int subscribe_id,
 		    wpabuf_len(elems), wpabuf_head(elems))) ||
 	    (ssi && nla_put(msg, QCA_WLAN_VENDOR_ATTR_USD_SSI,
 			    wpabuf_len(ssi), wpabuf_head(ssi))) ||
-	    (network_id && nla_put(msg, QCA_WLAN_VENDOR_ATTR_USD_NETWORK_ID,
-				   ETH_ALEN, network_id)))
+	    (network_id &&
+	     !ether_addr_equal(network_id, qca_usd_default_network_id) &&
+	     nla_put(msg, QCA_WLAN_VENDOR_ATTR_USD_NETWORK_ID, ETH_ALEN,
+		     network_id)))
 		goto fail;
 
 	attr = nla_nest_start(msg, QCA_WLAN_VENDOR_ATTR_USD_CHAN_CONFIG);
@@ -16271,6 +16421,7 @@ failed_stop:
 	nl80211_set_pr_dev(pd_bss, 0);
 failed:
 	nl80211_del_non_netdev(pd_bss);
+	nl80211_destroy_bss(pd_bss);
 	os_free(pd_bss);
 	return -1;
 }
@@ -16283,20 +16434,29 @@ static void nl80211_pd_stop(void *priv)
 {
 	struct i802_bss *bss = priv;
 	struct wpa_driver_nl80211_data *drv = bss->drv;
+	struct i802_bss *pd_bss = drv->pd_bss;
 
-	if (!drv->pd_bss)
+	if (!pd_bss)
 		return;
 
 	wpa_printf(MSG_DEBUG,
 		   "nl80211: Stopping PD wdev wdev_id=0x%llx addr=" MACSTR,
-		   (unsigned long long) drv->pd_bss->wdev_id,
-		   MAC2STR(drv->pd_bss->addr));
+		   (unsigned long long) pd_bss->wdev_id,
+		   MAC2STR(pd_bss->addr));
 
-	nl80211_set_pr_dev(drv->pd_bss, 0);
-	nl80211_destroy_bss(drv->pd_bss);
-	nl80211_del_non_netdev(drv->pd_bss);
-	os_free(drv->pd_bss);
+	/*
+	 * Detach the PD BSS from the driver first so that no event or command
+	 * routing path (nl80211_get_event_bss(), send_mlme(), set_key(),
+	 * start_peer_measurement()) can pick it up while it is being torn
+	 * down.
+	 */
 	drv->pd_bss = NULL;
+
+	nl80211_mgmt_unsubscribe(pd_bss, "PD wdev stop");
+	nl80211_set_pr_dev(pd_bss, 0);
+	nl80211_del_non_netdev(pd_bss);
+	nl80211_destroy_bss(pd_bss);
+	os_free(pd_bss);
 }
 
 

@@ -30,7 +30,7 @@ size_t hostapd_eid_uhr_capab_len(struct hostapd_data *hapd,
 		return 0;
 
 	if (uhr_cap->mac[1] & IEEE80211_UHR_MAC_CAP1_DBE_SUPP)
-		len++;
+		len += 3;
 
 	return len;
 }
@@ -93,6 +93,8 @@ u8 * hostapd_eid_uhr_capab(struct hostapd_data *hapd, u8 *eid,
 		 * even if operating in a lower bandwidth.
 		 */
 		*pos++ = dbe_bw;
+		*pos++ = 0; /* switch time period */
+		*pos++ = 0; /* mode change interval */
 	}
 
 	*length_pos = pos - (eid + 2);
@@ -122,12 +124,6 @@ u8 * hostapd_eid_uhr_operation(struct hostapd_data *hapd, u8 *eid, bool beacon)
 		oper_ctrl |= UHR_OPER_CTRL_DBE_ENA;
 		oper_ctrl |= dbe_bw;
 	}
-
-	/* TODO: Fill in appropriate UHR-MCS max Nss information */
-	oper->basic_uhr_mcs_nss_set[0] = 0x11;
-	oper->basic_uhr_mcs_nss_set[1] = 0x00;
-	oper->basic_uhr_mcs_nss_set[2] = 0x00;
-	oper->basic_uhr_mcs_nss_set[3] = 0x00;
 
 	pos += sizeof(*oper);
 

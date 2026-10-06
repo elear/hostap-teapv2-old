@@ -251,6 +251,9 @@
 #define WLAN_STATUS_DENIED_UHR_NOT_SUPPORTED 157
 #define WLAN_STATUS_REJECTED_ST_EXEC_TARGET_NOT_PREPARED 158
 #define WLAN_STATUS_REJECTED_INVALID_SECURITY_PROFILE 159
+#define WLAN_STATUS_POW_REQUIRED 166
+#define WLAN_STATUS_UNSUPPORTED_ML_KEM_PARAMETER 167
+#define WLAN_STATUS_INVALID_ML_KEM_PARAMETER 168
 
 /* Reason codes (IEEE Std 802.11-2020, 9.4.1.7, Table 9-90) */
 #define WLAN_REASON_UNSPECIFIED 1
@@ -492,6 +495,7 @@
 #define WLAN_EID_S1G_CAPABILITIES 217
 #define WLAN_EID_VENDOR_SPECIFIC 221
 #define WLAN_EID_S1G_OPERATION 232
+#define WLAN_EID_EXT_LENGTH 227
 #define WLAN_EID_CAG_NUMBER 237
 #define WLAN_EID_AP_CSN 239
 #define WLAN_EID_FILS_INDICATION 240
@@ -557,6 +561,10 @@
 #define WLAN_EID_EXT_TX_POWER_INDICATION 159
 #define WLAN_EID_EXT_SUPPORTED_GROUPS 161
 #define WLAN_EID_EXT_SECURITY_PROFILE 162
+#define WLAN_EID_EXT_POW 164
+
+/* IEEE P802.11bt/D1.0, Table 9-aa4 (Extended Length Element IDs) */
+#define WLAN_EID_EXT_LEN_PQC_PARAMETER 0
 
 /* Extended Capabilities field */
 #define WLAN_EXT_CAPAB_20_40_COEX 0
@@ -640,6 +648,7 @@
 #define WLAN_EXT_CAPAB_MSCS 85
 #define WLAN_EXT_CAPAB_SAE_PK_EXCLUSIVELY 88
 #define WLAN_EXT_CAPAB_KNOWN_STA_IDENTIFICATION 102
+#define WLAN_EXT_CAPAB_EXT_LEN_ELEMENT 117
 
 /* Extended RSN Capabilities */
 /* bits 0-3: Field length (n-1) */
@@ -658,6 +667,46 @@
 #define WLAN_RSNX_CAPAB_PMKSA_CACHING_PRIVACY 29
 #define WLAN_RSNX_CAPAB_SAE_PW_ID_CHANGE 34
 #define WLAN_RSNX_CAPAB_UNAUTH_EPPKE 36
+
+/* Security Profile element fields (IEEE P802.11bn/D2.0, 9.4.2.369) */
+/* Reduced RSN Capabilities field bits (Figure 9-aa75) */
+#define SEC_PROF_REDUCED_RSN_CAPA_EXT_KEY_ID		BIT(0)
+#define SEC_PROF_REDUCED_RSN_CAPA_OCVC			BIT(1)
+
+/* Security Profile Indication field (Figure 9-aa76):
+ * Bits 0-3: Number of Octets Of Security Profile Bitmap
+ * Bits 4-7: Number Of Vendor Specific Security Profiles
+ */
+#define SEC_PROF_IND_BITMAP_OCTETS(ind)  ((ind) & 0x0f)
+#define SEC_PROF_IND_VENDOR_COUNT(ind)   (((ind) >> 4) & 0x0f)
+
+/*
+ * Security Profile Number values (IEEE P802.11bn/D2.0, Table 9-bb18).
+ * All profiles use pairwise cipher GCMP-256 (00-0F-AC:9) and MFPR=1.
+ * AKM suites are 00-0F-AC:<value below>.
+ */
+#define SEC_PROF_EPPKE_NO_AUTH		0  /* EPPKE (29), no mutual auth */
+#define SEC_PROF_EPPKE_SAE		1  /* EPPKE (29) + SAE (24) */
+#define SEC_PROF_EPPKE_FT_SAE		2  /* EPPKE (29) + FT/SAE (25) */
+#define SEC_PROF_8021X_AUTH		3  /* 802.1X (5), EAP over Auth */
+#define SEC_PROF_8021X_FT_AUTH		4  /* 802.1X+FT (3), EAP over Auth */
+#define SEC_PROF_8021X_SHA384_AUTH	5  /* 802.1X SHA384 (23),
+					    * EAP over Auth */
+#define SEC_PROF_8021X_FT384_AUTH	6  /* 802.1X+FT SHA384 (22),
+					    * EAP over AUTH */
+#define SEC_PROF_8021X_SUITEB_AUTH	7  /* 802.1X Suite-B (12),
+					    * EAP over Auth */
+#define SEC_PROF_OWE			8  /* OWE/None (18) */
+#define SEC_PROF_SAE			9  /* SAE (24) */
+/* 10-119: Reserved */
+#define SEC_PROF_MAX			119
+
+static inline bool sec_prof_is_sae(int p)
+{
+	return p == SEC_PROF_EPPKE_SAE ||
+		p == SEC_PROF_EPPKE_FT_SAE ||
+		p == SEC_PROF_SAE;
+}
 
 /* Multiple BSSID element subelements */
 #define WLAN_MBSSID_SUBELEMENT_NONTRANSMITTED_BSSID_PROFILE 0
@@ -2745,7 +2794,7 @@ struct ieee80211_he_mu_edca_parameter_set {
 #define RNR_TBTT_INFO_MLD_PARAM2_LINK_DISABLED  0x20
 
 /* IEEE Std 802.11be-2024, 9.4.2.321 - EHT Operation element */
-#define EHT_OPERATION_ELEM_MIN_LEN                       1
+#define EHT_OPERATION_ELEM_MIN_LEN                       5
 
 /* Figure 9-1074j: EHT Operation Parameters field format */
 #define EHT_OPER_INFO_PRESENT                          BIT(0)
@@ -2781,8 +2830,6 @@ struct ieee80211_eht_operation {
 	u8 basic_eht_mcs_nss_set[4];
 	struct ieee80211_eht_oper_info oper_info; /* 0 or 3 or 5 octets */
 } STRUCT_PACKED;
-
-#define IEEE80211_EHT_OP_MIN_LEN (1 + 4)
 
 /* IEEE Std 802.11be-2024, 9.4.2.323 - EHT Capabilities element */
 #define EHT_CAPABILITIES_ELEM_MIN_LEN             11
@@ -3339,16 +3386,16 @@ struct ieee80211_uhr_capabilities {
 #define UHR_OPER_CTRL_DBE_ENA               0x0008
 #define UHR_OPER_CTRL_DBE_BW_SHIFT		4
 #define UHR_OPER_CTRL_DBE_BW_MASK           0x0070
-#define UHR_OPER_CTRL_DUO_OP_PARAMS_PRES    0x0080
-#define UHR_OPER_CTRL_DPS_OP_PARAMS_PRES    0x0100
-#define UHR_OPER_CTRL_NPCA_OP_PARAMS_PRES   0x0200
-#define UHR_OPER_CTRL_P_EDCA_OP_PARAMS_PRES 0x0400
-#define UHR_OPER_CTRL_DPE_OP_PARAMS_PRES    0x0800
+#define UHR_OPER_CTRL_ELR_RX                0x0080
+#define UHR_OPER_CTRL_DUO_OP_PARAMS_PRES    0x0100
+#define UHR_OPER_CTRL_DPS_OP_PARAMS_PRES    0x0200
+#define UHR_OPER_CTRL_NPCA_OP_PARAMS_PRES   0x0400
+#define UHR_OPER_CTRL_P_EDCA_OP_PARAMS_PRES 0x0800
+#define UHR_OPER_CTRL_DPE_OP_PARAMS_PRES    0x1000
 
 /* UHR Operation element format */
 struct ieee80211_uhr_operation {
 	le16 oper_ctrl; /* UHR Operation Control: UHR_OPER_CTRL_* bits */
-	u8 basic_uhr_mcs_nss_set[4];
 	/* UHR Operations Parameters - variable */
 } STRUCT_PACKED;
 
@@ -3366,14 +3413,14 @@ struct ieee80211_uhr_operation {
 #define IEEE80211_UHR_OPER_MAX_SIZE	\
 	(sizeof(struct ieee80211_uhr_operation) + 1 + 4 + 6 + 3 + 3)
 
-/* IEEE P802.11bn/D1.4, Figure 9-aa4 (NPCA Operation Parameters field format) */
-#define UHR_OPER_PARAMS_NPCA_PRI_CHAN_OFFS		0x0000000F
-#define UHR_OPER_PARAMS_NPCA_NPCA_MIN_DUR_THRESH	0x000000F0
-#define UHR_OPER_PARAMS_NPCA_NPCA_SWITCH_DELAY		0x00003F00
-#define UHR_OPER_PARAMS_NPCA_NPCA_SWITCH_BACK_DELAY	0x000FC000
-#define UHR_OPER_PARAMS_NPCA_INIT_NPCA_QRSC		0x00300000
-#define UHR_OPER_PARAMS_NPCA_MOPLEN_NPCA		0x00400000
-#define UHR_OPER_PARAMS_NPCA_DIS_SUBCH_BITMAP_PRES	0x00800000
+/* IEEE P802.11bn/D1.5, Figure 9-aa6 (NPCA Operation Parameters field format) */
+#define UHR_OPER_PARAMS_NPCA_PRI_CHAN			0x000000FF
+#define UHR_OPER_PARAMS_NPCA_NPCA_MIN_DUR_THRESH	0x00000F00
+#define UHR_OPER_PARAMS_NPCA_NPCA_SWITCH_DELAY		0x0003F000
+#define UHR_OPER_PARAMS_NPCA_NPCA_SWITCH_BACK_DELAY	0x00FC0000
+#define UHR_OPER_PARAMS_NPCA_INIT_NPCA_QRSC		0x03000000
+#define UHR_OPER_PARAMS_NPCA_MOPLEN_NPCA		0x04000000
+#define UHR_OPER_PARAMS_NPCA_DIS_SUBCH_BITMAP_PRES	0x08000000
 
 #ifdef _MSC_VER
 #pragma pack(pop)

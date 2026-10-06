@@ -35,7 +35,6 @@
 #define WLAN_STA_WDS BIT_ULL(14)
 #define WLAN_STA_ASSOC_REQ_OK BIT_ULL(15)
 #define WLAN_STA_WPS2 BIT_ULL(16)
-#define WLAN_STA_GAS BIT_ULL(17)
 #define WLAN_STA_VHT BIT_ULL(18)
 #define WLAN_STA_WNM_SLEEP_MODE BIT_ULL(19)
 #define WLAN_STA_VHT_OPMODE_ENABLED BIT_ULL(20)
@@ -46,6 +45,7 @@
 #define WLAN_STA_6GHZ BIT_ULL(25)
 #define WLAN_STA_PENDING_PASN_FILS_ERP BIT_ULL(26)
 #define WLAN_STA_EHT BIT_ULL(27)
+#define WLAN_STA_DSCP_POLICY BIT_ULL(28)
 #define WLAN_STA_PENDING_DISASSOC_CB BIT_ULL(29)
 #define WLAN_STA_PENDING_DEAUTH_CB BIT_ULL(30)
 #define WLAN_STA_NONERP BIT_ULL(31)
@@ -92,17 +92,11 @@ struct eap_over_auth_data {
 };
 
 #define EHT_ML_MAX_STA_PROF_LEN 1024
-struct mld_info {
-	bool mld_sta;
 
-	struct ml_common_info {
-		u8 mld_addr[ETH_ALEN];
-		u16 medium_sync_delay;
-		u16 eml_capa;
-		u16 mld_capa;
-	} common_info;
-
-	struct mld_link_info links[MAX_NUM_MLD_LINKS];
+struct dscp_policy_state {
+	size_t offset;
+	u8 last_dialog_token;
+	bool pending_more;
 };
 
 struct sta_info {
@@ -112,6 +106,11 @@ struct sta_info {
 	be32 ipaddr;
 	struct dl_list ip6addr; /* list head for struct ip6addr */
 	u16 aid; /* STA's unique AID (1 .. 2007) or 0 if not yet assigned */
+#ifdef CONFIG_IEEE80211BE
+	u16 wds_ifname_id; /* WDS interface name identifier (1 .. 2007) for MLO
+			    * WDS stations, used to generate unique interface
+			    * names. 0 if not yet assigned. */
+#endif /* CONFIG_IEEE80211BE */
 	u16 disconnect_reason_code; /* RADIUS server override */
 	unsigned long long flags; /* Bitfield of WLAN_STA_* */
 	u16 capability;
@@ -238,12 +237,6 @@ struct sta_info {
 				* transaction identifiers */
 	struct os_reltime sa_query_start;
 
-#if defined(CONFIG_INTERWORKING) || defined(CONFIG_DPP)
-#define GAS_DIALOG_MAX 8 /* Max concurrent dialog number */
-	struct gas_dialog_info *gas_dialog;
-	u8 gas_dialog_next;
-#endif /* CONFIG_INTERWORKING || CONFIG_DPP */
-
 	struct wpabuf *wps_ie; /* WPS IE from (Re)Association Request */
 	struct wpabuf *p2p_ie; /* P2P IE from (Re)Association Request */
 	struct wpabuf *hs20_ie; /* HS 2.0 IE from (Re)Association Request */
@@ -343,6 +336,7 @@ struct sta_info {
 
 #ifdef CONFIG_PASN
 	struct pasn_data *pasn;
+	bool sec_prof_used;
 #endif /* CONFIG_PASN */
 
 #ifdef CONFIG_IEEE80211BE
@@ -362,6 +356,14 @@ struct sta_info {
 #ifdef CONFIG_IEEE8021X_AUTH
 	struct eap_over_auth_data eap_auth_data;
 #endif /* CONFIG_IEEE8021X_AUTH */
+
+#ifdef CONFIG_ROBUST_AV
+	struct hostapd_dscp_policy **policies;
+	unsigned int num_dscp_policies;
+	bool dscp_reset;
+	u8 unsolicited_dialog_token;
+	struct dscp_policy_state dscp_state;
+#endif /* CONFIG_ROBUST_AV */
 };
 
 

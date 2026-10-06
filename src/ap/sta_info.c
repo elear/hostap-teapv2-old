@@ -39,6 +39,7 @@
 #include "sta_info.h"
 #include "vlan.h"
 #include "wps_hostapd.h"
+#include "robust_av.h"
 
 static void ap_sta_remove_in_other_bss(struct hostapd_data *hapd,
 				       struct sta_info *sta);
@@ -235,8 +236,13 @@ void set_wpa_sm_for_each_partner_link(struct hostapd_data *hapd,
 			continue;
 
 		lsta = ap_get_sta(lhapd, psta->addr);
-		if (lsta)
+		if (lsta) {
+			if (lsta->wpa_sm && lsta->wpa_sm != wpa_sm)
+				wpa_printf(MSG_DEBUG,
+					   "AP MLD: Replacing lsta->wpa_sm %p with %p for a partner link",
+					   lsta->wpa_sm, wpa_sm);
 			lsta->wpa_sm = wpa_sm;
+		}
 	}
 }
 
@@ -260,8 +266,12 @@ void clear_wpa_sm_for_all_sta(struct hostapd_data *hapd,
 		struct sta_info *sta;
 
 		for (sta = lhapd->sta_list; sta; sta = sta->next) {
-			if (sta->wpa_sm == wpa_sm)
+			if (sta->wpa_sm == wpa_sm) {
+				wpa_printf(MSG_DEBUG,
+					   "AP MLD: Clearing to be freed wpa_sm=%p pointer from sta=%p",
+					   sta->wpa_sm, sta);
 				sta->wpa_sm = NULL;
+			}
 		}
 	}
 }
@@ -275,6 +285,7 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 	struct hostapd_data *vlan_bss = hapd;
 #endif /* CONFIG_NO_VLAN */
 	int set_beacon = 0;
+	bool remove = true;
 
 	accounting_sta_stop(hapd, sta);
 
@@ -286,8 +297,34 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 	    (sta->flags & WLAN_STA_MULTI_AP &&
 	     (hapd->conf->multi_ap & BACKHAUL_BSS) &&
 	     hapd->conf->wds_sta &&
-	     !(sta->flags & WLAN_STA_WPS)))
-		hostapd_set_wds_sta(hapd, NULL, sta->addr, sta->aid, 0);
+	     !(sta->flags & WLAN_STA_WPS))) {
+		int ifname_id = sta->aid;
+
+#ifdef CONFIG_IEEE80211BE
+		if (hapd->conf->mld_ap && (sta->flags & WLAN_STA_WDS))
+			ifname_id = sta->wds_ifname_id;
+
+		if (ap_sta_is_mld(hapd, sta)) {
+			struct hostapd_data *phapd;
+			struct sta_info *psta;
+
+			for_each_mld_link(phapd, hapd) {
+				if (phapd == hapd)
+					continue;
+
+				psta = ap_get_sta(phapd, sta->addr);
+				if (psta) {
+					remove = false;
+					break;
+				}
+			}
+		}
+#endif /* CONFIG_IEEE80211BE */
+
+		if (remove)
+			hostapd_set_wds_sta(hapd, NULL, sta->addr,
+					    ifname_id, 0);
+	}
 
 	if (sta->ipaddr)
 		hostapd_drv_br_delete_ip_neigh(hapd, 4, (u8 *) &sta->ipaddr);
@@ -305,6 +342,16 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 	if (sta->aid > 0)
 		hapd->sta_aid[(sta->aid - 1) / 32] &=
 			~BIT((sta->aid - 1) % 32);
+
+#ifdef CONFIG_IEEE80211BE
+	if (sta->wds_ifname_id > 0 && remove) {
+		struct hostapd_mld *mld = hapd->mld;
+
+		if (mld)
+			mld->wds_ifname_id[(sta->wds_ifname_id - 1) / 32] &=
+				~BIT((sta->wds_ifname_id - 1) % 32);
+	}
+#endif /* CONFIG_IEEE80211BE */
 
 	hapd->num_sta--;
 	if (sta->nonerp_set) {
@@ -390,18 +437,21 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 	ieee802_1x_free_station(hapd, sta);
 
 #ifdef CONFIG_IEEE80211BE
-	if (!ap_sta_is_mld(hapd, sta) ||
-	    hapd->mld_link_id == sta->mld_assoc_link_id) {
-		wpa_auth_sta_deinit(sta->wpa_sm);
-		/* Remove references from partner links. */
-		clear_wpa_sm_for_each_partner_link(hapd, sta);
-	}
-
 	/* Release group references in case non-association link STA is removed
 	 * before association link STA */
 	if (hostapd_sta_is_link_sta(hapd, sta))
 		wpa_release_link_auth_ref(sta->wpa_sm, hapd->mld_link_id,
 					  false);
+	if (!ap_sta_is_mld(hapd, sta) ||
+	    hapd->mld_link_id == sta->mld_assoc_link_id) {
+		struct wpa_state_machine *sm = sta->wpa_sm;
+
+		/* Remove references from partner links. */
+		clear_wpa_sm_for_each_partner_link(hapd, sta);
+
+		clear_wpa_sm_for_all_sta(hapd, sm);
+		wpa_auth_sta_deinit(sm);
+	}
 #else /* CONFIG_IEEE80211BE */
 	wpa_auth_sta_deinit(sta->wpa_sm);
 #endif /* CONFIG_IEEE80211BE */
@@ -449,16 +499,6 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 #ifdef CONFIG_P2P
 	p2p_group_notif_disassoc(hapd->p2p_group, sta->addr);
 #endif /* CONFIG_P2P */
-
-#if defined(CONFIG_INTERWORKING) || defined(CONFIG_DPP)
-	if (sta->gas_dialog) {
-		int i;
-
-		for (i = 0; i < GAS_DIALOG_MAX; i++)
-			gas_serv_dialog_clear(&sta->gas_dialog[i]);
-		os_free(sta->gas_dialog);
-	}
-#endif /* CONFIG_INTERWORKING || CONFIG_DPP */
 
 	wpabuf_free(sta->wps_ie);
 	wpabuf_free(sta->p2p_ie);
@@ -528,6 +568,8 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 	ap_sta_free_sta_profile(&sta->mld_info);
 	ml_deinit_link_reconf_req(&sta->reconf_req);
 #endif /* CONFIG_IEEE80211BE */
+
+	free_dscp_policies(sta);
 
 #ifdef CONFIG_TESTING_OPTIONS
 	os_free(sta->sae_postponed_commit);
@@ -792,14 +834,8 @@ static void ap_handle_session_timer(void *eloop_ctx, void *timeout_ctx)
 	wpa_printf(MSG_DEBUG, "%s: Session timer for STA " MACSTR,
 		   hapd->conf->iface, MAC2STR(sta->addr));
 	if (!(sta->flags & (WLAN_STA_AUTH | WLAN_STA_ASSOC |
-			    WLAN_STA_AUTHORIZED))) {
-		if (sta->flags & WLAN_STA_GAS) {
-			wpa_printf(MSG_DEBUG, "GAS: Remove temporary STA "
-				   "entry " MACSTR, MAC2STR(sta->addr));
-			ap_free_sta(hapd, sta);
-		}
+			    WLAN_STA_AUTHORIZED)))
 		return;
-	}
 
 	hostapd_drv_sta_deauth(hapd, sta->addr,
 			       WLAN_REASON_PREV_AUTH_NOT_VALID);
@@ -1035,7 +1071,7 @@ static void ap_sta_disconnect_common(struct hostapd_data *hapd,
 
 	wpa_printf(MSG_DEBUG,
 		   "reschedule ap_handle_timer timeout (%u sec) for " MACSTR,
-		   MAC2STR(sta->addr), timeout);
+		   timeout, MAC2STR(sta->addr));
 
 	eloop_cancel_timeout(ap_handle_timer, hapd, sta);
 	eloop_register_timeout(timeout, 0, ap_handle_timer, hapd, sta);
@@ -1045,8 +1081,11 @@ static void ap_sta_disconnect_common(struct hostapd_data *hapd,
 #ifdef CONFIG_IEEE80211BE
 	if (!ap_sta_is_mld(hapd, sta) ||
 	    hapd->mld_link_id == sta->mld_assoc_link_id) {
-		wpa_auth_sta_deinit(sta->wpa_sm);
+		struct wpa_state_machine *sm = sta->wpa_sm;
+
 		clear_wpa_sm_for_each_partner_link(hapd, sta);
+		clear_wpa_sm_for_all_sta(hapd, sm);
+		wpa_auth_sta_deinit(sm);
 	}
 #else /* CONFIG_IEEE80211BE */
 	wpa_auth_sta_deinit(sta->wpa_sm);
@@ -1971,7 +2010,7 @@ int ap_sta_flags_txt(unsigned long long flags, char *buf, size_t buflen)
 
 	buf[0] = '\0';
 	res = os_snprintf(buf, buflen,
-			  "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+			  "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
 			  (flags & WLAN_STA_AUTH ? "[AUTH]" : ""),
 			  (flags & WLAN_STA_ASSOC ? "[ASSOC]" : ""),
 			  (flags & WLAN_STA_AUTHORIZED ? "[AUTHORIZED]" : ""),
@@ -1987,7 +2026,6 @@ int ap_sta_flags_txt(unsigned long long flags, char *buf, size_t buflen)
 			  (flags & WLAN_STA_WDS ? "[WDS]" : ""),
 			  (flags & WLAN_STA_NONERP ? "[NonERP]" : ""),
 			  (flags & WLAN_STA_WPS2 ? "[WPS2]" : ""),
-			  (flags & WLAN_STA_GAS ? "[GAS]" : ""),
 			  (flags & WLAN_STA_HT ? "[HT]" : ""),
 			  (flags & WLAN_STA_VHT ? "[VHT]" : ""),
 			  (flags & WLAN_STA_HE ? "[HE]" : ""),

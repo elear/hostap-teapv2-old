@@ -448,6 +448,7 @@ u8 * hostapd_eid_eht_basic_ml_common(struct hostapd_data *hapd,
 	u8 common_info_len;
 	u16 mld_cap;
 	u8 max_simul_links, active_links;
+	u16 mld_eml_capa;
 
 	/*
 	 * As the Multi-Link element can exceed the size of 255 bytes need to
@@ -497,13 +498,16 @@ u8 * hostapd_eid_eht_basic_ml_common(struct hostapd_data *hapd,
 
 	wpabuf_put_u8(buf, hapd->eht_mld_bss_param_change);
 
-	/* Currently hard-code Enhanced Critical Updates Information to zero */
-	if (hostapd_is_uhr_enabled(hapd))
-		wpabuf_put_u8(buf, 0);
+	/* Set EMLSR/EMLMR Transition and Padding delay to zero for AP MLD as
+	 * per IEEE Std 802.11be-2024, 9.4.2.322.2.3 (Common Info field of the
+	 * Basic Multi-Link element).
+	 */
+	mld_eml_capa = hapd->iface->mld_eml_capa &
+		~(EHT_ML_EML_CAPA_EMLSR_TRANS_DELAY_MASK |
+		  EHT_ML_EML_CAPA_EMLSR_PADDING_DELAY_MASK);
 
-	wpa_printf(MSG_DEBUG, "MLD: EML Capabilities=0x%x",
-		   hapd->iface->mld_eml_capa);
-	wpabuf_put_le16(buf, hapd->iface->mld_eml_capa);
+	wpa_printf(MSG_DEBUG, "MLD: EML Capabilities=0x%x", mld_eml_capa);
+	wpabuf_put_le16(buf, mld_eml_capa);
 
 	mld_cap = hapd->iface->mld_mld_capa;
 	max_simul_links = mld_cap & EHT_ML_MLD_CAPA_MAX_NUM_SIM_LINKS_MASK;
@@ -533,6 +537,10 @@ u8 * hostapd_eid_eht_basic_ml_common(struct hostapd_data *hapd,
 			   hostapd_get_mld_id(hapd));
 		wpabuf_put_u8(buf, hostapd_get_mld_id(hapd));
 	}
+
+	/* Currently hard-code Enhanced Critical Updates Information to zero */
+	if (hostapd_is_uhr_enabled(hapd))
+		wpabuf_put_u8(buf, 0);
 
 	if (!mld_info)
 		goto out;
@@ -564,6 +572,14 @@ u8 * hostapd_eid_eht_basic_ml_common(struct hostapd_data *hapd,
 			sta_info_len++;
 
 		total_len = sta_info_len + link->resp_sta_profile_len;
+
+		if (wpabuf_tailroom(buf) < 100 + total_len &&
+		    wpabuf_resize(&buf, 100 + total_len) < 0) {
+			wpa_printf(MSG_ERROR,
+				   "MLD: Could not allocate buffer for constructing MLE");
+			wpabuf_free(buf);
+			return eid;
+		}
 
 		/* Per-STA Profile subelement */
 		wpabuf_put_u8(buf, MULTI_LINK_SUB_ELEM_ID_PER_STA_PROFILE);
@@ -705,6 +721,10 @@ size_t hostapd_eid_eht_basic_ml_len(struct hostapd_data *hapd,
 	if (include_mld_id)
 		len++;
 
+	/* Enhanced Critical Updates Information */
+	if (hostapd_is_uhr_enabled(hapd))
+		len++;
+
 	if (!info)
 		goto out;
 
@@ -729,6 +749,10 @@ size_t hostapd_eid_eht_basic_ml_len(struct hostapd_data *hapd,
 		/* BSS Parameters Change Count (1) for (Re)Association Response
 		 * frames */
 		if (include_bpcc)
+			sta_prof_len++;
+
+		/* Enhanced Critical Updates Information */
+		if (include_bpcc && hostapd_is_uhr_enabled(hapd))
 			sta_prof_len++;
 
 		/* Per-STA Profile Subelement(1), Length (1) */
@@ -828,7 +852,8 @@ static u8 * hostapd_eid_eht_reconf_ml(struct hostapd_data *hapd, u8 *eid)
 }
 
 
-static size_t hostapd_eid_eht_ml_len(struct mld_info *info,
+static size_t hostapd_eid_eht_ml_len(struct hostapd_data *hapd,
+				     struct mld_info *info,
 				     bool include_mld_id, bool include_bpcc)
 {
 	size_t len = 0;
@@ -836,6 +861,10 @@ static size_t hostapd_eid_eht_ml_len(struct mld_info *info,
 	u8 link_id;
 
 	if (include_mld_id)
+		eht_ml_len++;
+
+	/* Enhanced Critical Updates Information (1) in common info */
+	if (hostapd_is_uhr_enabled(hapd))
 		eht_ml_len++;
 
 	for (link_id = 0; info && link_id < ARRAY_SIZE(info->links);
@@ -852,6 +881,11 @@ static size_t hostapd_eid_eht_ml_len(struct mld_info *info,
 		/* BSS Parameters Change Count (1) for (Re)Association Response
 		 * frames */
 		if (include_bpcc)
+			sta_len++;
+
+		/* Enhanced Critical Updates Information (1) in per-STA profile
+		 */
+		if (include_bpcc && hostapd_is_uhr_enabled(hapd))
 			sta_len++;
 
 		/* Element data and (fragmentation) headers */
@@ -902,7 +936,7 @@ size_t hostapd_eid_eht_ml_beacon_len(struct hostapd_data *hapd,
 				     struct mld_info *info,
 				     bool include_mld_id)
 {
-	return hostapd_eid_eht_ml_len(info, include_mld_id, false);
+	return hostapd_eid_eht_ml_len(hapd, info, include_mld_id, false);
 }
 
 
@@ -1284,6 +1318,7 @@ u16 hostapd_process_ml_assoc_req(struct hostapd_data *hapd,
 	int ret = -1;
 	u16 ml_control;
 	const u8 *ml_end;
+	u8 saved_peer_addr[ETH_ALEN];
 
 	mlbuf = ieee802_11_defrag(elems->basic_mle, elems->basic_mle_len, true);
 	if (!mlbuf)
@@ -1339,7 +1374,7 @@ u16 hostapd_process_ml_assoc_req(struct hostapd_data *hapd,
 		wpa_printf(MSG_DEBUG, "MLD: EXT ML capabilities not present");
 	}
 
-	wpa_printf(MSG_DEBUG, "MLD: expected_common_info_len=%lu",
+	wpa_printf(MSG_DEBUG, "MLD: expected_common_info_len=%zu",
 		   common_info_len);
 
 	if (sizeof(*ml) + common_info_len > ml_len) {
@@ -1389,7 +1424,25 @@ u16 hostapd_process_ml_assoc_req(struct hostapd_data *hapd,
 		goto out;
 	}
 
+	/* Reset all per-link state before parsing the new MLE. A STA may send
+	 * back-to-back Reassociation Request frames with different MLEs (e.g.,
+	 * fewer links or without NSTR). The valid-flag-only reset would leave
+	 * stale fields (nstr_bitmap_len, peer_addr, nstr_bitmap, capability) in
+	 * non-association link slots and leak resp_sta_profile heap
+	 * allocations. Free those allocations and zero all link slots. The
+	 * association link's peer_addr holds the link-specific MAC (set from
+	 * mgmt->sa at auth time, before driver address translation) and must be
+	 * saved and restored.
+	 */
+	os_memcpy(saved_peer_addr, info->links[hapd->mld_link_id].peer_addr,
+		  ETH_ALEN);
+	ap_sta_free_sta_profile(info);
+	os_memset(info->links, 0, sizeof(info->links));
 	info->links[hapd->mld_link_id].valid = 1;
+	os_memcpy(info->links[hapd->mld_link_id].local_addr,
+		  hapd->own_addr, ETH_ALEN);
+	os_memcpy(info->links[hapd->mld_link_id].peer_addr,
+		  saved_peer_addr, ETH_ALEN);
 
 	/* Parse the Link Info field that starts after the end of the variable
 	 * length Common Info field. */
@@ -1410,6 +1463,8 @@ u16 hostapd_process_ml_assoc_req(struct hostapd_data *hapd,
 			goto out;
 		}
 
+		if ((size_t) num_frag_subelems * 2 > ml_len)
+			goto out;
 		ml_len -= num_frag_subelems * 2;
 		ml_end = ((const u8 *) ml) + ml_len;
 
@@ -1540,6 +1595,7 @@ u16 hostapd_process_ml_assoc_req(struct hostapd_data *hapd,
 out:
 	wpabuf_free(mlbuf);
 	if (ret) {
+		ap_sta_free_sta_profile(info);
 		os_memset(info, 0, sizeof(*info));
 		return WLAN_STATUS_UNSPECIFIED_FAILURE;
 	}
@@ -1688,9 +1744,10 @@ void hostapd_link_reconf_resp_tx_status(struct hostapd_data *hapd,
 			if (i == MAX_NUM_MLD_LINKS) {
 				wpa_printf(MSG_INFO,
 					   "MLD: No new assoc STA could be found; disconnect STA");
-				hostapd_notif_disassoc_mld(assoc_hapd, sta,
-							   sta->addr);
-				goto exit;
+				hostapd_notif_disassoc_mld(assoc_hapd,
+							   assoc_sta,
+							   assoc_sta->addr);
+				return;
 			}
 			wpa_printf(MSG_DEBUG, "MLD: New assoc link=%d", i);
 
@@ -1952,7 +2009,7 @@ hostapd_send_link_reconf_resp(struct hostapd_data *hapd,
 				continue;
 
 			link->valid = true;
-			ieee80211_ml_build_assoc_resp(lhapd, link);
+			ieee80211_ml_build_assoc_resp(lhapd, link, assoc_sta);
 		}
 		/* TODO: Basic MLE is not supposed to include BPCC in Link
 		 * Reconfiguration Response, but mac80211 implementation for
@@ -1961,7 +2018,7 @@ hostapd_send_link_reconf_resp(struct hostapd_data *hapd,
 		 * once mac80211 is fixed to match the standard (or this comment
 		 * be removed if the standard is modified to match
 		 * implementation). */
-		mle_len = hostapd_eid_eht_ml_len(&mld, false, true);
+		mle_len = hostapd_eid_eht_ml_len(hapd, &mld, false, true);
 		len += mle_len;
 	}
 
@@ -2070,7 +2127,7 @@ hostapd_send_link_reconf_resp(struct hostapd_data *hapd,
 							  false, true);
 		if ((size_t) (mle_pos - pos) != mle_len) {
 			wpa_printf(MSG_DEBUG,
-				   "MLD: Unexpected MLE length: %ld != %zu",
+				   "MLD: Unexpected MLE length: %td != %zu",
 				   mle_pos - pos, mle_len);
 			reject_all = true;
 			goto reject_all_req;
@@ -2158,6 +2215,9 @@ hostapd_parse_link_reconf_req_sta_profile(struct hostapd_data *hapd,
 	size_t nstr_bitmap_size = 0;
 	int ret = -1;
 	u16 status;
+
+	wpa_hexdump(MSG_MSGDUMP, "MLD: Link Reconfig Request subelement",
+		    buf, len);
 
 	if (len < sizeof(*elem) + 2UL)
 		goto out;
@@ -2248,7 +2308,7 @@ hostapd_parse_link_reconf_req_sta_profile(struct hostapd_data *hapd,
 	sta_info_len += nstr_bitmap_size;
 
 	sta_info = per_sta_prof->variable;
-	if (*sta_info > end - sta_info) {
+	if (sta_info >= end || *sta_info > end - sta_info) {
 		wpa_printf(MSG_DEBUG, "MLD: Not enough room for STA Info");
 		goto out;
 	}
@@ -2261,6 +2321,7 @@ hostapd_parse_link_reconf_req_sta_profile(struct hostapd_data *hapd,
 	}
 
 	sta_info_len = *sta_info;
+	wpa_hexdump(MSG_MSGDUMP, "MLD: STA Info", sta_info, sta_info_len);
 
 	os_memcpy(sta_addr, sta_info + 1, ETH_ALEN);
 	wpa_printf(MSG_DEBUG, "MLD: Link STA addr=" MACSTR, MAC2STR(sta_addr));
@@ -2336,6 +2397,10 @@ hostapd_parse_link_reconf_req_sta_profile(struct hostapd_data *hapd,
 	ret = 0;
 
 add_to_list:
+	if (sta_info && sta_prof_len)
+		wpa_hexdump(MSG_MSGDUMP, "MLD: STA Profile",
+			    sta_info, sta_prof_len);
+
 	info = os_zalloc(sizeof(struct link_reconf_req_info) + sta_prof_len);
 	if (!info) {
 		wpa_printf(MSG_DEBUG, "MLD: Failed to allocate request info");
@@ -2470,6 +2535,8 @@ hostapd_parse_link_reconf_req_reconf_mle(
 			goto fail;
 		}
 
+		if ((size_t) num_frag_subelems * 2 > len)
+			goto fail;
 		len -= num_frag_subelems * 2;
 		end = ((const u8 *) ml) + len;
 

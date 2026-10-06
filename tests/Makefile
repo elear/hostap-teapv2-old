@@ -3,7 +3,7 @@ ALL=test-base64 test-md4 test-milenage \
 	test-sha1 \
 	test-https test-https_server \
 	test-sha256 test-aes test-x509v3 test-list test-rc4 \
-	test-bss
+	test-bss test-mle
 
 include ../src/build.rules
 
@@ -142,6 +142,10 @@ CFLAGS_test-bss=$(WPA_CFLAGS)
 OBJS_test-bss=$(WPA_OBJS)
 include test.mk
 
+TEST=test-mle
+CFLAGS_test-mle=-DCONFIG_IEEE80211BE
+include test.mk
+
 run-tests: $(ALL)
 	./test-aes
 	./test-list
@@ -151,6 +155,7 @@ run-tests: $(ALL)
 	./test-sha1
 	./test-sha256
 	./test-bss
+	./test-mle
 	@echo
 	@echo All tests completed successfully.
 

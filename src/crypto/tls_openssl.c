@@ -7,6 +7,10 @@
  */
 
 #include "includes.h"
+#ifdef CONFIG_TLS_ENGINE_TRUSTED_PATH
+#include <sys/stat.h>
+#include <limits.h>
+#endif /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 #ifdef CONFIG_TESTING_OPTIONS
 #include <fcntl.h>
 #endif /* CONFIG_TESTING_OPTIONS */
@@ -443,6 +447,11 @@ static EVP_PKEY * provider_load_key(const char *uri)
 
 	while (!OSSL_STORE_eof(store)) {
 		info = OSSL_STORE_load(store);
+		if (!info) {
+			if (OSSL_STORE_error(store))
+				break;
+			continue;
+		}
 		if ((OSSL_STORE_INFO_get_type(info)) == OSSL_STORE_INFO_PKEY)
 			key = OSSL_STORE_INFO_get1_PKEY(info);
 
@@ -484,6 +493,11 @@ static X509 * provider_load_cert(const char *cert_id)
 
 	while (!OSSL_STORE_eof(store)) {
 		info = OSSL_STORE_load(store);
+		if (!info) {
+			if (OSSL_STORE_error(store))
+				break;
+			continue;
+		}
 		if ((OSSL_STORE_INFO_get_type(info)) == OSSL_STORE_INFO_CERT)
 			cert = OSSL_STORE_INFO_get1_CERT(info);
 
@@ -1021,6 +1035,79 @@ static int tls_engine_load_dynamic_generic(const char *pre[],
 }
 
 
+#ifdef CONFIG_TLS_ENGINE_TRUSTED_PATH
+
+#define TRUSTED_PATH "/usr/lib/"
+
+/**
+ * tls_engine_path_trusted - Verify engine .so path is trusted for loading
+ * @path: Engine/module path supplied via configuration or D-Bus
+ * @real_path: Buffer for the canonical path (PATH_MAX bytes)
+ * Returns: 0 if trusted (real_path filled), -1 otherwise
+ *
+ * The PKCS#11/OpenSC engine and module shared object paths are loaded with
+ * dlopen() within this process, which may be running with elevated
+ * privileges. Verify that the supplied path cannot be used to load an
+ * attacker-controlled shared library by requiring, in addition to being
+ * located under the trusted path, that the target is a regular file owned by
+ * root, not writable by group or others, and that every ancestor directory up
+ * to the file is itself a directory, owned by root and not writable by group
+ * or others (otherwise a root-owned file could be swapped by whoever controls
+ * such a directory). lstat() is used for the file check so that a symlink is
+ * never followed, even though realpath() has already canonicalised the path.
+ */
+static int tls_engine_path_trusted(const char *path, char *real_path)
+{
+	struct stat st;
+	char dir[PATH_MAX];
+	char *slash, *next;
+
+	if (!path)
+		return -1;
+
+	if (!realpath(path, real_path)) {
+		wpa_printf(MSG_INFO,
+			   "ENGINE: Refusing to load %s: realpath: %s",
+			   path, strerror(errno));
+		return -1;
+	}
+
+	if (os_strncmp(TRUSTED_PATH, real_path, os_strlen(TRUSTED_PATH)) != 0) {
+		wpa_printf(MSG_INFO,
+			   "ENGINE: Refusing to load %s: not in trusted path %s",
+			   real_path, TRUSTED_PATH);
+		return -1;
+	}
+
+	if (lstat(real_path, &st) != 0 || !S_ISREG(st.st_mode) ||
+	    st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+		wpa_printf(MSG_INFO,
+			   "ENGINE: Refusing to load %s: not a root-owned, non-writable regular file",
+			   real_path);
+		return -1;
+	}
+
+	os_strlcpy(dir, real_path, sizeof(dir));
+	slash = dir;
+	while ((next = os_strchr(slash + 1, '/')) {
+		*next = '\0';
+		if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+		    st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+			wpa_printf(MSG_INFO,
+				   "ENGINE: Refusing to load %s: insecure ancestor directory %s",
+				   real_path, dir);
+			return -1;
+		}
+		*next = '/';
+		slash = next;
+	}
+
+	return 0;
+}
+
+#endif /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
+
+
 /**
  * tls_engine_load_dynamic_pkcs11 - load the pkcs11 engine provided by opensc
  * @pkcs11_so_path: pksc11_so_path from the configuration
@@ -1030,6 +1117,10 @@ static int tls_engine_load_dynamic_pkcs11(const char *pkcs11_so_path,
 					  const char *pkcs11_module_path)
 {
 	char *engine_id = "pkcs11";
+#ifdef CONFIG_TLS_ENGINE_TRUSTED_PATH
+	char real_pkcs11_so_path[PATH_MAX];
+	char real_pkcs11_module_path[PATH_MAX];
+#endif /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 	const char *pre_cmd[] = {
 		"SO_PATH", NULL /* pkcs11_so_path */,
 		"ID", NULL /* engine_id */,
@@ -1046,12 +1137,29 @@ static int tls_engine_load_dynamic_pkcs11(const char *pkcs11_so_path,
 	if (!pkcs11_so_path)
 		return 0;
 
+#ifdef CONFIG_TLS_ENGINE_TRUSTED_PATH
+	if (tls_engine_path_trusted(pkcs11_so_path, real_pkcs11_so_path) < 0)
+		return -1;
+	pre_cmd[1] = real_pkcs11_so_path;
+#else /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 	pre_cmd[1] = pkcs11_so_path;
+#endif /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 	pre_cmd[3] = engine_id;
+#ifdef CONFIG_TLS_ENGINE_TRUSTED_PATH
+	if (pkcs11_module_path) {
+		if (tls_engine_path_trusted(pkcs11_module_path,
+					    real_pkcs11_module_path) < 0)
+			return -1;
+		post_cmd[1] = real_pkcs11_module_path;
+	} else {
+		post_cmd[0] = NULL;
+	}
+#else /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 	if (pkcs11_module_path)
 		post_cmd[1] = pkcs11_module_path;
 	else
 		post_cmd[0] = NULL;
+#endif /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 
 	wpa_printf(MSG_DEBUG, "ENGINE: Loading pkcs11 Engine from %s",
 		   pkcs11_so_path);
@@ -1067,6 +1175,9 @@ static int tls_engine_load_dynamic_pkcs11(const char *pkcs11_so_path,
 static int tls_engine_load_dynamic_opensc(const char *opensc_so_path)
 {
 	char *engine_id = "opensc";
+#ifdef CONFIG_TLS_ENGINE_TRUSTED_PATH
+	char real_opensc_so_path[PATH_MAX];
+#endif /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 	const char *pre_cmd[] = {
 		"SO_PATH", NULL /* opensc_so_path */,
 		"ID", NULL /* engine_id */,
@@ -1078,7 +1189,13 @@ static int tls_engine_load_dynamic_opensc(const char *opensc_so_path)
 	if (!opensc_so_path)
 		return 0;
 
+#ifdef CONFIG_TLS_ENGINE_TRUSTED_PATH
+	if (tls_engine_path_trusted(opensc_so_path, real_opensc_so_path) < 0)
+		return -1;
+	pre_cmd[1] = real_opensc_so_path;
+#else /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 	pre_cmd[1] = opensc_so_path;
+#endif /* CONFIG_TLS_ENGINE_TRUSTED_PATH */
 	pre_cmd[3] = engine_id;
 
 	wpa_printf(MSG_DEBUG, "ENGINE: Loading OpenSC Engine from %s",
@@ -2668,6 +2785,34 @@ static void debug_print_cert(X509 *cert, const char *title)
 }
 
 
+/*
+ * OpenSSL 4.0 deprecated X509_cmp_current_time() in favor of an API that
+ * reports the reason as an X509_V_ERR_* code. Returns 0 if @cert is valid.
+ */
+static int tls_cert_time_error(const X509 *cert)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+	int err;
+
+	if (X509_check_certificate_times(NULL, cert, &err))
+		return 0;
+
+	/* The caller can act only on the two validity window errors */
+	if (err == X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD)
+		return X509_V_ERR_CERT_HAS_EXPIRED;
+	if (err == X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD)
+		return X509_V_ERR_CERT_NOT_YET_VALID;
+	return err;
+#else /* OpenSSL < 4.0 */
+	if (X509_cmp_current_time(X509_get_notBefore(cert)) > 0)
+		return X509_V_ERR_CERT_NOT_YET_VALID;
+	if (X509_cmp_current_time(X509_get_notAfter(cert)) < 0)
+		return X509_V_ERR_CERT_HAS_EXPIRED;
+	return 0;
+#endif /* OpenSSL < 4.0 */
+}
+
+
 static int tls_verify_cb(int preverify_ok, X509_STORE_CTX *x509_ctx)
 {
 	char buf[256];
@@ -2711,17 +2856,18 @@ static int tls_verify_cb(int preverify_ok, X509_STORE_CTX *x509_ctx)
 
 	if (!conn->ca_cert_verify && depth == 0 &&
 	    !(conn->flags & TLS_CONN_DISABLE_TIME_CHECKS)) {
-		if (X509_cmp_current_time(X509_get_notBefore(err_cert)) > 0) {
+		int terr = tls_cert_time_error(err_cert);
+
+		if (terr == X509_V_ERR_CERT_NOT_YET_VALID) {
 			wpa_printf(MSG_INFO,
 				   "OpenSSL: Server certificate is not valid at the current time");
-			err = X509_V_ERR_CERT_NOT_YET_VALID;
+			err = terr;
 			X509_STORE_CTX_set_error(x509_ctx, err);
 			preverify_ok = 0;
-		} else if (X509_cmp_current_time(X509_get_notAfter(err_cert)) <
-			   0) {
+		} else if (terr == X509_V_ERR_CERT_HAS_EXPIRED) {
 			wpa_printf(MSG_INFO,
 				   "TLS: Server certificate has expired");
-			err = X509_V_ERR_CERT_HAS_EXPIRED;
+			err = terr;
 			X509_STORE_CTX_set_error(x509_ctx, err);
 			preverify_ok = 0;
 		}
@@ -6233,9 +6379,22 @@ static const char * openssl_pkey_type_str(const EVP_PKEY *pkey)
 		return "DH";
 	case EVP_PKEY_EC:
 		return "EC";
-	default:
-		return "?";
 	}
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	/*
+	 * Algorithms implemented in a provider, e.g., ML-DSA, do not have a
+	 * built-in EVP_PKEY type.
+	 */
+	{
+		const char *name = EVP_PKEY_get0_type_name(pkey);
+
+		if (name)
+			return name;
+	}
+#endif /* OpenSSL >= 3.0 */
+
+	return "?";
 }
 
 

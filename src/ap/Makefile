@@ -3,12 +3,17 @@ CFLAGS += -DNEED_AP_MLME
 CFLAGS += -DCONFIG_ETH_P_OUI
 CFLAGS += -DCONFIG_HS20
 CFLAGS += -DCONFIG_INTERWORKING
+CFLAGS += -DCONFIG_IEEE80211AC
+CFLAGS += -DCONFIG_IEEE80211AX
+CFLAGS += -DCONFIG_IEEE80211BE
+CFLAGS += -DCONFIG_IEEE80211BN
 CFLAGS += -DCONFIG_IEEE80211R
 CFLAGS += -DCONFIG_IEEE80211R_AP
 CFLAGS += -DCONFIG_WPS
 CFLAGS += -DCONFIG_PROXYARP
 CFLAGS += -DCONFIG_IPV6
 CFLAGS += -DCONFIG_AIRTIME_POLICY
+CFLAGS += -DCONFIG_ROBUST_AV
 
 LIB_OBJS= \
 	accounting.o \
@@ -32,8 +37,11 @@ LIB_OBJS= \
 	hw_features.o \
 	ieee802_11_auth.o \
 	ieee802_11.o \
+	ieee802_11_eht.o \
+	ieee802_11_he.o \
 	ieee802_11_ht.o \
 	ieee802_11_shared.o \
+	ieee802_11_uhr.o \
 	ieee802_11_vht.o \
 	ieee802_1x.o \
 	interference.o \
@@ -42,6 +50,7 @@ LIB_OBJS= \
 	p2p_hostapd.o \
 	pmksa_cache_auth.o \
 	preauth_auth.o \
+	robust_av.o \
 	rrm.o \
 	sta_info.o \
 	tkip_countermeasures.o \
